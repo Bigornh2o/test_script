@@ -1,0 +1,2333 @@
+import re
+import time
+import os
+import json
+import tempfile
+from datetime import datetime
+from pathlib import Path
+import pandas as pd
+import sys
+import tkinter as tk
+from tkinter import messagebox, ttk, filedialog, simpledialog
+from tkcalendar import DateEntry
+from playwright.sync_api import sync_playwright
+
+# En .exe sans console (--noconsole), sys.stdout vaut None
+if sys.stdout is not None:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+# ============================================================
+# Paramètres
+# ============================================================
+URL_LOGIN = "https://cockpitind.ch.pbk/#/login"
+CHEMIN_MDP = r"P:\CPSI_CONTROL_DATA\SAS_DATA\LES3\Robot_Cockpit\Input\mdpBIIQJ_cockpit.xlsx"
+CHROME_PATH = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+
+# JSON de config par utilisateur
+CONFIG_JSON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cockpit_output_dirs.json")
+
+GUI_COLUMNS = [
+    "N_intv",
+    "Date",
+    "Statement_type",
+    "Performance_type",
+    "Est_currency",
+    "Language",
+    "Monthly_perf_history",
+    "Annual_perf_history",
+    "Anonymized_document",
+    "Client_signature",
+]
+
+DEFAULT_GUI_VALUES = {
+    "Statement_type": "STANDARD",
+    "Performance_type": "MWR",
+    "Est_currency": "EUR",
+    "Language": "FRENCH",
+    "Monthly_perf_history": "2025-07",
+    "Annual_perf_history": "2012",
+    "Anonymized_document": False,
+    "Client_signature": False,
+}
+
+LISTE_PERFORMANCE_TYPE = ["MWR", "TWR"]
+LISTE_EST_CURRENCY = ["EUR", "USD", "CHF", "GBP"]
+LISTE_LANGUAGE = ["FRENCH", "ENGLISH", "GERMAN", "ITALIAN", "SPANISH", "DUTCH"]
+
+BLUE = "#0b3d91"
+WHITE = "#ffffff"
+TEXT_DARK = "#111111"
+GREEN = "#1a7f37"
+GRAY = "#666666"
+RED = "#b42318"
+
+SEL_USERNAME = 'input[formcontrolname="username"]'
+SEL_PASSWORD = 'input[formcontrolname="password"]'
+SEL_SUBMIT = 'button[type="submit"]'
+SEL_CHAMP_RELATION = 'input#typeaheadBasic[placeholder="Relationship number"]'
+
+SEL_ROWS = "div.ag-center-cols-container div[role='row']"
+SEL_CELL_RELATION = "div[col-id='relationshipNumber']"
+
+TIMEOUT_CHAMP_MS = 60000
+INTERVALLE_NOTIFS_SEC = 3
+TIMEOUT_NOTIFS_MIN = 30
+
+
+def generer_liste_monthly():
+    aujourd_hui = datetime.today()
+
+    annee_debut = aujourd_hui.year - 1
+    mois_debut = 1
+
+    if aujourd_hui.month == 1:
+        annee_fin = aujourd_hui.year - 1
+        mois_fin = 12
+    else:
+        annee_fin = aujourd_hui.year
+        mois_fin = aujourd_hui.month - 1
+
+    resultat = []
+    annee = annee_debut
+    mois = mois_debut
+
+    while (annee < annee_fin) or (annee == annee_fin and mois <= mois_fin):
+        resultat.append(f"{annee}-{mois:02d}")
+        mois += 1
+        if mois == 13:
+            mois = 1
+            annee += 1
+
+    return list(reversed(resultat))
+
+
+LISTE_MONTHLY = generer_liste_monthly()
+LISTE_ANNUAL = [str(y) for y in range(2012, datetime.today().year + 1)]
+
+# =========================
+# Identifiants Cockpit
+# =========================
+mdp = pd.read_excel(CHEMIN_MDP)
+mdp = list(mdp.values.tolist())
+USERNAME = mdp[0][0]
+PASSWORD = mdp[0][1]
+
+
+# ============================================================
+# Config utilisateur / output dir / presets
+# ============================================================
+def get_ut_code():
+    """
+    Essaie de récupérer le code UT Windows.
+    Exemple attendu : ut34e9
+    """
+    candidats = []
+
+    try:
+        candidats.append(os.getlogin())
+    except Exception:
+        pass
+
+    for var in ["USERNAME", "USER", "LOGNAME"]:
+        val = os.environ.get(var)
+        if val:
+            candidats.append(val)
+
+    try:
+        home_name = Path.home().name
+        if home_name:
+            candidats.append(home_name)
+    except Exception:
+        pass
+
+    for val in candidats:
+        val = str(val).strip()
+        if re.fullmatch(r"ut[a-zA-Z0-9]+", val, flags=re.IGNORECASE):
+            return val.lower()
+
+    for val in candidats:
+        val = str(val).strip()
+        if val:
+            return val.lower()
+
+    return "unknown_user"
+
+
+def log(message):
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}")
+
+
+def migrer_structure_config(data):
+    """
+    Migre l'ancien format :
+      {
+        "ut34e9": "P:/mon/output"
+      }
+    vers le nouveau format :
+      {
+        "ut34e9": {
+          "output_path": "P:/mon/output",
+          "presets": {},
+          "last_params": {}
+        }
+      }
+    """
+    if not isinstance(data, dict):
+        return {}
+
+    nouveau = {}
+    for cle, val in data.items():
+        if isinstance(val, str):
+            nouveau[cle] = {
+                "output_path": val,
+                "presets": {},
+                "last_params": {}
+            }
+        elif isinstance(val, dict):
+            output_path = val.get("output_path", "")
+            presets = val.get("presets", {})
+            last_params = val.get("last_params", {})
+
+            if not isinstance(presets, dict):
+                presets = {}
+
+            if not isinstance(last_params, dict):
+                last_params = {}
+
+            if not output_path:
+                for k_alt in ["output", "output_dir", "path"]:
+                    if isinstance(val.get(k_alt), str):
+                        output_path = val.get(k_alt)
+                        break
+
+            nouveau[cle] = {
+                "output_path": str(output_path or "").strip(),
+                "presets": presets,
+                "last_params": last_params
+            }
+        else:
+            nouveau[cle] = {
+                "output_path": "",
+                "presets": {},
+                "last_params": {}
+            }
+
+    return nouveau
+
+
+def charger_config():
+    if not os.path.exists(CONFIG_JSON_PATH):
+        return {}
+
+    try:
+        with open(CONFIG_JSON_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        data = migrer_structure_config(data)
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        log(f"ATTENTION : lecture JSON impossible ({e}), démarrage avec config vide.")
+        return {}
+
+
+def sauvegarder_config(config):
+    dossier = os.path.dirname(CONFIG_JSON_PATH)
+    if dossier:
+        os.makedirs(dossier, exist_ok=True)
+
+    fd, temp_path = tempfile.mkstemp(prefix="cfg_", suffix=".json", dir=dossier or None)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+        os.replace(temp_path, CONFIG_JSON_PATH)
+    except Exception:
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except Exception:
+            pass
+        raise
+
+
+def get_user_cfg(config, ut_code):
+    bloc = config.setdefault(ut_code, {})
+    if not isinstance(bloc, dict):
+        bloc = {}
+        config[ut_code] = bloc
+
+    if "output_path" not in bloc or not isinstance(bloc.get("output_path"), str):
+        bloc["output_path"] = ""
+
+    if "presets" not in bloc or not isinstance(bloc.get("presets"), dict):
+        bloc["presets"] = {}
+
+    if "last_params" not in bloc or not isinstance(bloc.get("last_params"), dict):
+        bloc["last_params"] = {}
+
+    return bloc
+
+
+def charger_output_dir_pour_utilisateur(config, ut_code):
+    return str(get_user_cfg(config, ut_code).get("output_path", "")).strip()
+
+
+def sauvegarder_output_dir_pour_utilisateur(config, ut_code, output_dir):
+    get_user_cfg(config, ut_code)["output_path"] = str(output_dir or "").strip()
+
+
+def get_presets_pour_utilisateur(config, ut_code):
+    return get_user_cfg(config, ut_code).setdefault("presets", {})
+
+
+def get_last_params_pour_utilisateur(config, ut_code):
+    return get_user_cfg(config, ut_code).setdefault("last_params", {})
+
+
+def sauvegarder_last_params_pour_utilisateur(config, ut_code, payload):
+    get_user_cfg(config, ut_code)["last_params"] = payload if isinstance(payload, dict) else {}
+
+
+def charger_last_params_pour_utilisateur(config, ut_code):
+    val = get_user_cfg(config, ut_code).get("last_params", {})
+    return val if isinstance(val, dict) else {}
+
+
+# ============================================================
+# Outils
+# ============================================================
+def clean_n_intv(value):
+    if pd.isna(value):
+        return None
+    value = str(value).strip()
+    if value.endswith(".0"):
+        value = value[:-2]
+    if not value:
+        return None
+    digits = re.sub(r"\D", "", value)
+    if not digits:
+        return None
+    return digits.zfill(7)
+
+
+def normaliser_date(value):
+    if pd.isna(value):
+        return None
+
+    if isinstance(value, (datetime, pd.Timestamp)):
+        return value.strftime("%d.%m.%Y")
+
+    texte = str(value).strip()
+    if not texte:
+        return None
+
+    for fmt in ("%d.%m.%Y", "%d/%m/%Y", "%Y-%m-%d", "%d%m%Y"):
+        try:
+            dt = datetime.strptime(texte, fmt)
+            return dt.strftime("%d.%m.%Y")
+        except ValueError:
+            pass
+
+    dt = pd.to_datetime(texte, dayfirst=True, errors="coerce")
+    if pd.isna(dt):
+        raise ValueError(f"Date invalide : {value}")
+
+    return dt.strftime("%d.%m.%Y")
+
+
+def normaliser_statement_type(value):
+    if pd.isna(value):
+        raise ValueError("La colonne du type de statement est vide.")
+
+    txt = str(value).strip().lower()
+
+    mapping = {
+        "standard": "Standard",
+        "std": "Standard",
+        "full": "Full",
+        "light": "Light",
+    }
+
+    if txt not in mapping:
+        raise ValueError(
+            f"Valeur de statement type invalide : {value}. "
+            f"Valeurs attendues : Standard, Full, Light."
+        )
+
+    return mapping[txt]
+
+
+def normaliser_texte(value, default=""):
+    if pd.isna(value):
+        return default
+    txt = str(value).strip()
+    return txt if txt else default
+
+
+def to_bool(value):
+    if pd.isna(value):
+        return False
+    if isinstance(value, bool):
+        return value
+    txt = str(value).strip().lower()
+    return txt in ("1", "true", "yes", "oui", "x", "vrai")
+
+
+def texte_normalise(value):
+    return str(value or "").strip().upper()
+
+
+def valeurs_egales(a, b):
+    return texte_normalise(a) == texte_normalise(b)
+
+
+def bool_egal(a, b):
+    return bool(a) == bool(b)
+
+
+def construire_dataframe_depuis_n_intv(liste_n_intv, date_defaut=None):
+    if date_defaut is None:
+        date_defaut = datetime.today().strftime("%d.%m.%Y")
+
+    lignes = []
+    for n in liste_n_intv:
+        lignes.append({
+            "N_intv": clean_n_intv(n) or "",
+            "Date": date_defaut,
+            "Statement_type": DEFAULT_GUI_VALUES["Statement_type"],
+            "Performance_type": DEFAULT_GUI_VALUES["Performance_type"],
+            "Est_currency": DEFAULT_GUI_VALUES["Est_currency"],
+            "Language": DEFAULT_GUI_VALUES["Language"],
+            "Monthly_perf_history": DEFAULT_GUI_VALUES["Monthly_perf_history"],
+            "Annual_perf_history": DEFAULT_GUI_VALUES["Annual_perf_history"],
+            "Anonymized_document": DEFAULT_GUI_VALUES["Anonymized_document"],
+            "Client_signature": DEFAULT_GUI_VALUES["Client_signature"],
+        })
+
+    return pd.DataFrame(lignes, columns=GUI_COLUMNS)
+
+
+def lire_lignes_depuis_df(df):
+    colonnes_obligatoires = [
+        "N_intv",
+        "Date",
+        "Statement_type",
+        "Performance_type",
+        "Est_currency",
+        "Language",
+        "Monthly_perf_history",
+        "Annual_perf_history",
+        "Anonymized_document",
+        "Client_signature",
+    ]
+
+    for col in colonnes_obligatoires:
+        if col not in df.columns:
+            raise ValueError(f"La colonne '{col}' est introuvable dans le DataFrame.")
+
+    resultats = []
+    for _, row in df.iterrows():
+        n_intv = clean_n_intv(row["N_intv"])
+        if not n_intv:
+            continue
+
+        resultats.append({
+            "N_intv": n_intv,
+            "Date": normaliser_date(row["Date"]),
+            "StatementType": normaliser_statement_type(row["Statement_type"]),
+            "PerformanceType": normaliser_texte(row["Performance_type"]),
+            "Est_currency": normaliser_texte(row["Est_currency"]),
+            "Language": normaliser_texte(row["Language"]),
+            "Monthly_perf_history": normaliser_texte(row["Monthly_perf_history"]),
+            "Annual_perf_history": normaliser_texte(row["Annual_perf_history"]),
+            "Anonymized_document": to_bool(row["Anonymized_document"]),
+            "Client_signature": to_bool(row["Client_signature"]),
+        })
+
+    return resultats
+
+
+def contient_n_intv(texte, n_intv):
+    return re.search(rf"(?<!\d){re.escape(n_intv)}(?!\d)", texte or "") is not None
+
+
+def contient_n_intv_souple(texte, n_intv):
+    n = str(n_intv).lstrip("0") or "0"
+    return re.search(rf"(?<!\d)0*{re.escape(n)}(?!\d)", texte or "") is not None
+
+
+def extraire_n_intv_depuis_texte(texte):
+    if not texte:
+        return []
+
+    morceaux = re.split(r"[\s,;\n\r\t]+", texte)
+    resultats = []
+    vus = set()
+
+    for m in morceaux:
+        n = clean_n_intv(m)
+        if n and n not in vus:
+            vus.add(n)
+            resultats.append(n)
+
+    return resultats
+
+
+def charger_n_intv_depuis_xlsx(chemin_fichier):
+    df = pd.read_excel(chemin_fichier)
+
+    col_trouvee = None
+    for c in df.columns:
+        if str(c).strip().lower() in ["n_intv", "n intv", "relationship number", "relationship_number"]:
+            col_trouvee = c
+            break
+
+    if col_trouvee is None:
+        if len(df.columns) == 1:
+            col_trouvee = df.columns[0]
+        else:
+            raise ValueError(
+                "Impossible d'identifier la colonne des N_intv dans le fichier chargé. "
+                "Merci d'utiliser une colonne nommée 'N_intv'."
+            )
+
+    liste = []
+    vus = set()
+    for val in df[col_trouvee]:
+        n = clean_n_intv(val)
+        if n and n not in vus:
+            vus.add(n)
+            liste.append(n)
+
+    return liste
+
+
+# ============================================================
+# Helpers Playwright - lecture intelligente des champs
+# ============================================================
+def lire_valeur_input(page, selector):
+    try:
+        champ = page.locator(selector).first
+        champ.wait_for(state="visible", timeout=5000)
+        return champ.input_value().strip()
+    except Exception:
+        return ""
+
+
+def lire_valeur_ng_select(page, formcontrolname):
+    base = page.locator(f'[formcontrolname="{formcontrolname}"]').first
+    try:
+        base.wait_for(state="visible", timeout=5000)
+    except Exception:
+        return ""
+
+    selectors = [
+        ".ng-value-label",
+        ".ng-single-label",
+        ".ng-value",
+        ".ng-input input",
+        "input",
+        ".ng-placeholder",
+    ]
+
+    for sel in selectors:
+        try:
+            loc = base.locator(sel).first
+            if loc.count() == 0:
+                continue
+
+            tag = ""
+            try:
+                tag = loc.evaluate("(el) => el.tagName")
+            except Exception:
+                pass
+
+            if str(tag).upper() == "INPUT":
+                val = loc.input_value().strip()
+            else:
+                val = (loc.inner_text() or "").strip()
+
+            if val:
+                return val
+        except Exception:
+            pass
+
+    try:
+        txt = (base.inner_text() or "").strip()
+        return txt
+    except Exception:
+        return ""
+
+
+def remplir_ng_select_si_necessaire(page, formcontrolname, value, libelle=None):
+    actuel = lire_valeur_ng_select(page, formcontrolname)
+    attendu = str(value).strip()
+
+    if valeurs_egales(actuel, attendu):
+        log(f"{libelle or formcontrolname} déjà correct : {attendu}")
+        return
+
+    log(f"Mise à jour {libelle or formcontrolname} : '{actuel}' -> '{attendu}'")
+
+    champ = page.locator(f'[formcontrolname="{formcontrolname}"]').first
+    champ.wait_for(state="visible", timeout=15000)
+    champ.scroll_into_view_if_needed()
+    champ.click()
+
+    input_interne = champ.locator("input").first
+    input_interne.wait_for(state="visible", timeout=5000)
+    input_interne.fill("")
+    input_interne.type(attendu, delay=50)
+    input_interne.press("Enter")
+
+
+def regler_checkbox(page, formcontrolname, cocher):
+    cb = page.locator(f'input[formcontrolname="{formcontrolname}"]').first
+    cb.wait_for(state="visible", timeout=15000)
+
+    if cocher:
+        if not cb.is_checked():
+            cb.check(force=True)
+    else:
+        if cb.is_checked():
+            cb.uncheck(force=True)
+
+
+def lire_checkbox(page, formcontrolname):
+    try:
+        cb = page.locator(f'input[formcontrolname="{formcontrolname}"]').first
+        cb.wait_for(state="visible", timeout=5000)
+        return cb.is_checked()
+    except Exception:
+        return False
+
+
+def clear_et_saisir_date_si_necessaire(page, date_value):
+    champ = page.locator('input[formcontrolname="valuationDate"]').first
+    champ.wait_for(state="visible", timeout=15000)
+    actuel = champ.input_value().strip()
+    attendu = str(date_value).strip()
+
+    try:
+        actuel_norm = normaliser_date(actuel) if actuel else ""
+    except Exception:
+        actuel_norm = actuel
+
+    try:
+        attendu_norm = normaliser_date(attendu) if attendu else ""
+    except Exception:
+        attendu_norm = attendu
+
+    if actuel_norm == attendu_norm:
+        log(f"Date déjà correcte : {actuel_norm}")
+        return
+
+    log(f"Mise à jour Date : '{actuel}' -> '{attendu_norm}'")
+    champ.scroll_into_view_if_needed()
+    champ.click()
+    champ.press("Control+A")
+    champ.press("Backspace")
+    champ.fill(attendu_norm)
+
+
+def saisir_performance_type_si_necessaire(page, performance_type):
+    attendu = str(performance_type).strip()
+    actuel = lire_valeur_ng_select(page, "performanceType")
+
+    if valeurs_egales(actuel, attendu):
+        log(f"Performance Type déjà correct : {attendu}")
+        return
+
+    log(f"Mise à jour Performance Type : '{actuel}' -> '{attendu}'")
+
+    champ = page.locator('[formcontrolname="performanceType"]').first
+    champ.wait_for(state="visible", timeout=15000)
+    champ.scroll_into_view_if_needed()
+    champ.click()
+
+    input_interne = champ.locator("input").first
+    input_interne.wait_for(state="visible", timeout=5000)
+    input_interne.fill("")
+    input_interne.type(attendu, delay=50)
+    input_interne.press("Enter")
+
+
+def file_name_attendu(n_intv, statement_type):
+    date_stamp = time.strftime("%d%m%Y")
+    return f"{n_intv}_{date_stamp}_Portfolio_Statement_{statement_type}"
+
+
+def remplir_file_name_si_necessaire(page, n_intv, statement_type):
+    attendu = file_name_attendu(n_intv, statement_type)
+    champ = page.locator("textarea[formcontrolname='description']").first
+    champ.wait_for(state="visible", timeout=15000)
+
+    try:
+        actuel = champ.input_value().strip()
+    except Exception:
+        try:
+            actuel = (champ.inner_text() or "").strip()
+        except Exception:
+            actuel = ""
+
+    if actuel == attendu:
+        log(f"File Name déjà correct : {attendu}")
+        return
+
+    log(f"Mise à jour File Name : '{actuel}' -> '{attendu}'")
+    champ.scroll_into_view_if_needed()
+    champ.click()
+    champ.press("Control+A")
+    champ.press("Backspace")
+    champ.fill(attendu)
+
+
+def lire_statement_type_selectionne(page):
+    mapping = {
+        "Standard": 'button[data-cy="button-switch-multi-0"]',
+        "Full": 'button[data-cy="button-switch-multi-1"]',
+        "Light": 'button[data-cy="button-switch-multi-2"]',
+    }
+
+    for libelle, selector in mapping.items():
+        try:
+            btn = page.locator(selector).first
+            btn.wait_for(state="visible", timeout=3000)
+            classes = (btn.get_attribute("class") or "").lower()
+            aria_pressed = (btn.get_attribute("aria-pressed") or "").lower()
+            if "active" in classes or "selected" in classes or aria_pressed == "true":
+                return libelle
+        except Exception:
+            pass
+
+    return ""
+
+
+def lire_file_name(page):
+    try:
+        champ = page.locator("textarea[formcontrolname='description']").first
+        champ.wait_for(state="visible", timeout=5000)
+        try:
+            return champ.input_value().strip()
+        except Exception:
+            return (champ.inner_text() or "").strip()
+    except Exception:
+        return ""
+
+
+def lire_parametres_modale(page, ligne):
+    return {
+        "StatementType": lire_statement_type_selectionne(page),
+        "Date": lire_valeur_input(page, 'input[formcontrolname="valuationDate"]'),
+        "PerformanceType": lire_valeur_ng_select(page, "performanceType"),
+        "Est_currency": lire_valeur_ng_select(page, "estimationCurrency"),
+        "Language": lire_valeur_ng_select(page, "language"),
+        "Monthly_perf_history": lire_valeur_ng_select(page, "monthlyPerformanceFrom"),
+        "Annual_perf_history": lire_valeur_ng_select(page, "annualPerformanceFrom"),
+        "Anonymized_document": lire_checkbox(page, "anonymizedDocument"),
+        "Client_signature": lire_checkbox(page, "bienTrouve"),
+        "FileName": lire_file_name(page),
+        "FileNameAttendu": file_name_attendu(ligne["N_intv"], ligne["StatementType"]),
+    }
+
+
+def comparer_parametres_modale(page, ligne):
+    lus = lire_parametres_modale(page, ligne)
+
+    attendu_date = normaliser_date(ligne["Date"])
+    try:
+        lu_date = normaliser_date(lus["Date"]) if lus["Date"] else ""
+    except Exception:
+        lu_date = lus["Date"]
+
+    ecarts = []
+
+    if not valeurs_egales(lus["StatementType"], ligne["StatementType"]):
+        ecarts.append(f"StatementType: lu='{lus['StatementType']}' attendu='{ligne['StatementType']}'")
+
+    if lu_date != attendu_date:
+        ecarts.append(f"Date: lue='{lus['Date']}' attendue='{attendu_date}'")
+
+    if not valeurs_egales(lus["PerformanceType"], ligne["PerformanceType"]):
+        ecarts.append(f"PerformanceType: lu='{lus['PerformanceType']}' attendu='{ligne['PerformanceType']}'")
+
+    if not valeurs_egales(lus["Est_currency"], ligne["Est_currency"]):
+        ecarts.append(f"Est_currency: lu='{lus['Est_currency']}' attendu='{ligne['Est_currency']}'")
+
+    if not valeurs_egales(lus["Language"], ligne["Language"]):
+        ecarts.append(f"Language: lu='{lus['Language']}' attendu='{ligne['Language']}'")
+
+    if not valeurs_egales(lus["Monthly_perf_history"], ligne["Monthly_perf_history"]):
+        ecarts.append(f"Monthly_perf_history: lu='{lus['Monthly_perf_history']}' attendu='{ligne['Monthly_perf_history']}'")
+
+    if not valeurs_egales(lus["Annual_perf_history"], ligne["Annual_perf_history"]):
+        ecarts.append(f"Annual_perf_history: lu='{lus['Annual_perf_history']}' attendu='{ligne['Annual_perf_history']}'")
+
+    if not bool_egal(lus["Anonymized_document"], ligne["Anonymized_document"]):
+        ecarts.append(f"Anonymized_document: lu='{lus['Anonymized_document']}' attendu='{ligne['Anonymized_document']}'")
+
+    if not bool_egal(lus["Client_signature"], ligne["Client_signature"]):
+        ecarts.append(f"Client_signature: lu='{lus['Client_signature']}' attendu='{ligne['Client_signature']}'")
+
+    if lus["FileName"] != lus["FileNameAttendu"]:
+        ecarts.append(f"FileName: lu='{lus['FileName']}' attendu='{lus['FileNameAttendu']}'")
+
+    return ecarts, lus
+
+
+def verifier_et_corriger_parametres_avant_generate(page, ligne):
+    log("Vérification finale des paramètres avant Generate...")
+
+    # 1er contrôle
+    ecarts, valeurs_lues = comparer_parametres_modale(page, ligne)
+
+    if ecarts:
+        log("Écarts détectés avant Generate :")
+        for e in ecarts:
+            log(f" - {e}")
+
+        cliquer_statement_type(page, ligne["StatementType"])
+        clear_et_saisir_date_si_necessaire(page, ligne["Date"])
+        saisir_performance_type_si_necessaire(page, ligne["PerformanceType"])
+        remplir_ng_select_si_necessaire(page, "estimationCurrency", ligne["Est_currency"], "Estimation currency")
+        remplir_ng_select_si_necessaire(page, "language", ligne["Language"], "Language")
+        remplir_ng_select_si_necessaire(page, "monthlyPerformanceFrom", ligne["Monthly_perf_history"], "Monthly performance history")
+        remplir_ng_select_si_necessaire(page, "annualPerformanceFrom", ligne["Annual_perf_history"], "Annual performance history")
+        regler_checkbox(page, "anonymizedDocument", ligne["Anonymized_document"])
+        regler_checkbox(page, "bienTrouve", ligne["Client_signature"])
+        remplir_file_name_si_necessaire(page, ligne["N_intv"], ligne["StatementType"])
+
+        page.wait_for_timeout(500)
+
+    # 2e contrôle de confirmation
+    ecarts_finaux, valeurs_finales = comparer_parametres_modale(page, ligne)
+
+    if ecarts_finaux:
+        detail = " ; ".join(ecarts_finaux)
+        raise RuntimeError(f"Contrôle final KO avant Generate : {detail}")
+
+    log("Contrôle final OK : tous les paramètres sont conformes.")
+
+
+# ============================================================
+# Connexion / champ Relationship number
+# ============================================================
+def attendre_champ_relation_actif(page, timeout=TIMEOUT_CHAMP_MS):
+    champ = page.locator(SEL_CHAMP_RELATION).first
+    champ.wait_for(state="visible", timeout=timeout)
+
+    debut = time.time()
+    page.wait_for_function(
+        "(sel) => { const el = document.querySelector(sel); return !!el && !el.disabled; }",
+        arg=SEL_CHAMP_RELATION,
+        timeout=timeout
+    )
+    attente = time.time() - debut
+    if attente > 1:
+        log(f"Champ Relationship number actif après {attente:.1f}s (chargement de la grille)")
+
+    return champ
+
+
+def connexion(page):
+    log("Accès à la page de login...")
+    page.goto(URL_LOGIN, wait_until="domcontentloaded")
+
+    page.wait_for_selector(SEL_USERNAME, state="visible", timeout=15000)
+    page.locator(SEL_USERNAME).fill(USERNAME)
+
+    page.wait_for_selector(SEL_PASSWORD, state="visible", timeout=15000)
+    page.locator(SEL_PASSWORD).fill(PASSWORD)
+
+    page.locator(SEL_SUBMIT).click()
+
+    attendre_champ_relation_actif(page)
+    log("Connexion réussie.")
+
+
+# ============================================================
+# Sélection du N_intv
+# ============================================================
+def selectionner_n_intv_typeahead(page, n_intv):
+    champ = attendre_champ_relation_actif(page)
+
+    log(f"Saisie de {n_intv} dans Relationship number...")
+    champ.click()
+    champ.fill(n_intv)
+    champ.press("Enter")
+
+    popup = page.locator("ngb-typeahead-window").first
+    popup.wait_for(state="visible", timeout=15000)
+
+    options = popup.locator('button[role="option"]')
+    cible = None
+    deadline = time.time() + 10
+
+    while time.time() < deadline and cible is None:
+        try:
+            count = options.count()
+        except Exception:
+            count = 0
+
+        for i in range(count):
+            opt = options.nth(i)
+            try:
+                if contient_n_intv(opt.inner_text(), n_intv):
+                    cible = opt
+                    break
+            except Exception:
+                pass
+
+        if cible is None:
+            page.wait_for_timeout(250)
+
+    if cible is None:
+        try:
+            suggestions = [t.strip() for t in options.all_inner_texts()]
+        except Exception:
+            suggestions = []
+        raise RuntimeError(
+            f"Aucune suggestion correspondant à {n_intv} trouvée. "
+            f"Suggestions visibles : {suggestions}"
+        )
+
+    cible.click(force=True)
+    log(f"Suggestion {n_intv} cliquée.")
+
+
+def checker_n_intv_grille(page, n_intv, timeout=30000):
+    cellules = page.locator(f"{SEL_ROWS} {SEL_CELL_RELATION}")
+    deadline = time.time() + timeout / 1000
+    textes = []
+
+    while time.time() < deadline:
+        try:
+            textes = [t.strip() for t in cellules.all_inner_texts() if t.strip()]
+        except Exception:
+            textes = []
+
+        if textes and all(contient_n_intv(t, n_intv) for t in textes):
+            log(f"Check OK ({len(textes)} ligne(s)) : {textes[0].replace(chr(10), ' | ')}")
+            return
+
+        page.wait_for_timeout(250)
+
+    apercu = [t.replace("\n", " | ") for t in textes[:3]]
+    raise RuntimeError(
+        f"Check KO : la grille n'est pas filtrée sur {n_intv} "
+        f"({len(textes)} ligne(s), ex. : {apercu})"
+    )
+
+
+# ============================================================
+# Génération du Portfolio Statement
+# ============================================================
+def cliquer_statements_et_portfolio(page):
+    log("Ouverture du menu Statements...")
+
+    page.get_by_role("button", name=re.compile(r"Statements", re.I)).first.click()
+
+    menu = page.locator("pms-actions-container .selection-container-open-actions")
+    menu.wait_for(state="visible", timeout=15000)
+
+    log("Sélection de Portfolio Statement...")
+
+    portfolio_item = menu.get_by_text("Portfolio Statement", exact=True).first
+    portfolio_item.wait_for(state="visible", timeout=15000)
+    portfolio_item.click()
+
+    log("Portfolio Statement sélectionné.")
+
+
+def cliquer_statement_type(page, statement_type):
+    mapping = {
+        "Standard": 'button[data-cy="button-switch-multi-0"]',
+        "Full": 'button[data-cy="button-switch-multi-1"]',
+        "Light": 'button[data-cy="button-switch-multi-2"]',
+    }
+
+    if statement_type not in mapping:
+        raise ValueError(f"Type de statement inconnu : {statement_type}")
+
+    btn = page.locator(mapping[statement_type]).first
+    btn.wait_for(state="visible", timeout=15000)
+
+    try:
+        classes = btn.get_attribute("class") or ""
+    except Exception:
+        classes = ""
+
+    if "active" in classes.lower() or "selected" in classes.lower():
+        log(f"Statement Type déjà correct : {statement_type}")
+        return
+
+    log(f"Clic sur {statement_type.upper()}...")
+    btn.click()
+    log(f"{statement_type.upper()} cliqué.")
+
+
+def cliquer_generate(page):
+    log("Clic sur Generate...")
+    generate_btn = page.get_by_role("button", name=re.compile(r"^GENERATE$", re.I)).first
+    generate_btn.wait_for(state="visible", timeout=15000)
+    generate_btn.click()
+    log("Generate cliqué.")
+
+
+def cliquer_close_popup_generation(page):
+    log("Attente de la popup de génération...")
+
+    popup = page.locator("lest-user-options-pop-up-modal").last
+    popup.wait_for(state="attached", timeout=30000)
+
+    popup.get_by_text("Portfolio Statement Generation", exact=True).wait_for(
+        state="visible",
+        timeout=15000
+    )
+
+    popup.get_by_text("Process successfully submitted", exact=False).wait_for(
+        state="visible",
+        timeout=15000
+    )
+
+    close_btn = popup.locator("div.lest-popup-modal-footer button").filter(
+        has_text=re.compile(r"^\s*Close\s*$", re.I)
+    ).first
+
+    close_btn.wait_for(state="visible", timeout=15000)
+    close_btn.scroll_into_view_if_needed()
+    close_btn.click(force=True)
+
+    log("Close cliqué dans la popup de génération.")
+
+
+def traiter_modal_portfolio(page, ligne):
+    page.wait_for_selector(
+        "text=Portfolio Statement Parameters",
+        state="visible",
+        timeout=15000
+    )
+
+    cliquer_statement_type(page, ligne["StatementType"])
+    clear_et_saisir_date_si_necessaire(page, ligne["Date"])
+    saisir_performance_type_si_necessaire(page, ligne["PerformanceType"])
+    remplir_ng_select_si_necessaire(page, "estimationCurrency", ligne["Est_currency"], "Estimation currency")
+    remplir_ng_select_si_necessaire(page, "language", ligne["Language"], "Language")
+    remplir_ng_select_si_necessaire(page, "monthlyPerformanceFrom", ligne["Monthly_perf_history"], "Monthly performance history")
+    remplir_ng_select_si_necessaire(page, "annualPerformanceFrom", ligne["Annual_perf_history"], "Annual performance history")
+    regler_checkbox(page, "anonymizedDocument", ligne["Anonymized_document"])
+    regler_checkbox(page, "bienTrouve", ligne["Client_signature"])
+    remplir_file_name_si_necessaire(page, ligne["N_intv"], ligne["StatementType"])
+
+    # Vérification finale juste avant génération
+    verifier_et_corriger_parametres_avant_generate(page, ligne)
+
+    cliquer_generate(page)
+    cliquer_close_popup_generation(page)
+
+
+# ============================================================
+# Nettoyage entre deux N_intv
+# ============================================================
+def attendre_fermeture_modals(page, timeout=20000):
+    page.wait_for_function(
+        """() => !document.querySelector('modal-container')
+                 && !document.querySelector('bs-modal-backdrop')
+                 && !document.body.classList.contains('modal-open')""",
+        timeout=timeout
+    )
+
+
+def cliquer_clear_all_filters(page):
+    log("Clic sur Clear all filters...")
+
+    try:
+        attendre_fermeture_modals(page)
+    except Exception as e:
+        log(f"ATTENTION : un modal semble encore ouvert : {e}")
+
+    btn = page.locator("button.clear-filters-btn").first
+    btn.wait_for(state="visible", timeout=10000)
+
+    try:
+        btn.click(timeout=10000)
+        log("Clear all filters cliqué.")
+    except Exception as e:
+        log(f"Clic normal échoué ({e}), tentative via DOM...")
+        btn.evaluate("(el) => el.click()")
+        log("Clear all filters cliqué (via DOM click).")
+
+    try:
+        page.wait_for_function(
+            "(sel) => { const el = document.querySelector(sel); return !!el && el.disabled; }",
+            arg=SEL_CHAMP_RELATION,
+            timeout=3000
+        )
+    except Exception:
+        pass
+
+
+# ============================================================
+# Notifications / téléchargements
+# ============================================================
+def nom_attendu(row):
+    date_stamp = time.strftime("%d%m%Y")
+    return f"{row['N_intv']}_{date_stamp}_Portfolio_Statement_{row['StatementType']}"
+
+
+def chemin_libre(output_dir, filename):
+    target_path = os.path.join(output_dir, filename)
+    base, ext = os.path.splitext(filename)
+    i = 1
+    while os.path.exists(target_path):
+        target_path = os.path.join(output_dir, f"{base}_{i}{ext}")
+        i += 1
+    return target_path
+
+
+def cliquer_cloche_notification(page):
+    log("Clic sur la cloche de notification...")
+
+    cloche = page.locator('button.btn-notification').first
+    cloche.wait_for(state="visible", timeout=15000)
+    cloche.scroll_into_view_if_needed()
+    cloche.click(force=True)
+
+    log("Cloche cliquée.")
+
+
+def panneau_notifications_ouvert(page):
+    try:
+        return page.locator("cp-notification").first.is_visible()
+    except Exception:
+        return False
+
+
+def ouvrir_panneau_notifications(page):
+    if panneau_notifications_ouvert(page):
+        return
+    cliquer_cloche_notification(page)
+    page.locator("cp-notification").first.wait_for(state="visible", timeout=15000)
+
+
+def fermer_panneau_notifications(page):
+    if not panneau_notifications_ouvert(page):
+        return
+    try:
+        page.locator('button.btn-notification').first.click(force=True)
+        page.wait_for_timeout(500)
+    except Exception:
+        pass
+
+
+def identifier_ligne(texte, restants):
+    texte = (texte or "").casefold()
+    for row in restants:
+        if nom_attendu(row).casefold() in texte:
+            return row
+    return None
+
+
+def cliquer_un_accept(page, restants, output_dir):
+    accept_buttons = page.locator("cp-notification").locator(
+        "button.btn.pms-btn.validation-btn"
+    ).filter(has_text=re.compile(r"^\s*Accept\s*$", re.I))
+
+    for i in range(accept_buttons.count()):
+        btn = accept_buttons.nth(i)
+        try:
+            if not btn.is_visible():
+                continue
+
+            try:
+                texte_notif = btn.locator("xpath=ancestor::li[1]").first.inner_text()
+            except Exception:
+                texte_notif = ""
+
+            with page.expect_download(timeout=30000) as download_info:
+                btn.evaluate("(el) => el.click()")
+
+            download = download_info.value
+            nom_cockpit = download.suggested_filename or f"fichier_{int(time.time() * 1000)}.pdf"
+
+            row = identifier_ligne(f"{nom_cockpit} {texte_notif}", restants)
+
+            if row:
+                chemin = chemin_libre(output_dir, f"{nom_attendu(row)}.pdf")
+                verification = "OK"
+            else:
+                chemin = chemin_libre(output_dir, nom_cockpit)
+                verification = "NON VERIFIE - fichier non renommé"
+                log(f"ATTENTION : fichier '{nom_cockpit}' non reconnu, gardé sous son nom d'origine.")
+
+            download.save_as(chemin)
+            page.wait_for_timeout(3000)
+
+            return {
+                "N_intv": row["N_intv"] if row else "",
+                "Date": row["Date"] if row else "",
+                "StatementType": row["StatementType"] if row else "",
+                "PerformanceType": row.get("PerformanceType", "") if row else "",
+                "Est_currency": row.get("Est_currency", "") if row else "",
+                "Language": row.get("Language", "") if row else "",
+                "Monthly_perf_history": row.get("Monthly_perf_history", "") if row else "",
+                "Annual_perf_history": row.get("Annual_perf_history", "") if row else "",
+                "Fichier": chemin,
+                "Nom Cockpit": nom_cockpit,
+                "Verification": verification,
+                "_row": row,
+            }
+
+        except Exception as e:
+            log(f"Impossible de traiter Accept #{i + 1} : {e}")
+
+    return None
+
+
+def attendre_et_telecharger_fichiers(page, expected_rows, output_dir,
+                                     interval_seconds=INTERVALLE_NOTIFS_SEC,
+                                     timeout_minutes=TIMEOUT_NOTIFS_MIN):
+    fichiers = []
+    restants = list(expected_rows)
+    nb_attendus = len(expected_rows)
+
+    if not restants:
+        log("Aucune génération réussie, pas de fichier à attendre.")
+        return fichiers
+
+    os.makedirs(output_dir, exist_ok=True)
+    log(f"Attente de {nb_attendus} fichier(s) dans les notifications...")
+
+    deadline = time.time() + timeout_minutes * 60
+    termine = False
+
+    while restants and not termine and time.time() < deadline:
+        try:
+            ouvrir_panneau_notifications(page)
+
+            while restants:
+                info = cliquer_un_accept(page, restants, output_dir)
+                if not info:
+                    if len(fichiers) >= nb_attendus:
+                        termine = True
+                    break
+                if info["_row"]:
+                    restants.remove(info["_row"])
+                fichiers.append(info)
+                log(f"Fichier {len(fichiers)} ({info['Verification']}) : {info['Fichier']}")
+
+        except Exception as e:
+            log(f"ATTENTION : erreur pendant la vérification des notifications : {e}")
+
+        if not restants or termine:
+            break
+
+        nb_ok = nb_attendus - len(restants)
+        log(f"{nb_ok}/{nb_attendus} fichier(s) vérifié(s), nouvelle vérification dans {interval_seconds}s...")
+        fermer_panneau_notifications(page)
+        page.wait_for_timeout(interval_seconds * 1000)
+
+    if restants:
+        manquants = [nom_attendu(r) for r in restants]
+        log(f"ATTENTION : {len(restants)} fichier(s) non retrouvé(s) : {manquants}")
+    else:
+        log(f"OK : les {nb_attendus} fichier(s) ont été récupérés et vérifiés.")
+
+    return fichiers
+
+
+# ============================================================
+# Traitement principal
+# ============================================================
+def run(playwright, df, output_dir):
+    browser = playwright.chromium.launch(
+        executable_path=CHROME_PATH,
+        headless=False
+    )
+    context = browser.new_context(accept_downloads=True)
+    page = context.new_page()
+
+    page.set_default_timeout(15000)
+    page.set_viewport_size({"width": 1650, "height": 1000})
+
+    resultats = []
+    fichiers = []
+    rows_to_process = []
+    rows_generees = []
+    nb_generes = 0
+
+    try:
+        connexion(page)
+
+        rows_to_process = lire_lignes_depuis_df(df)
+        log(f"{len(rows_to_process)} valeur(s) N_intv à traiter")
+
+        for idx, ligne in enumerate(rows_to_process, start=1):
+            n_intv = ligne["N_intv"]
+            date_ligne = ligne["Date"]
+            statement_type = ligne["StatementType"]
+            performance_type = ligne["PerformanceType"]
+
+            log(
+                f"===== {idx}/{len(rows_to_process)} : "
+                f"{n_intv} / {date_ligne} / {statement_type} / {performance_type} ====="
+            )
+            try:
+                selectionner_n_intv_typeahead(page, n_intv)
+                checker_n_intv_grille(page, n_intv)
+
+                cliquer_statements_et_portfolio(page)
+                traiter_modal_portfolio(page, ligne)
+
+                nb_generes += 1
+                rows_generees.append(ligne)
+                resultats.append({
+                    "N_intv": n_intv,
+                    "Date": date_ligne,
+                    "StatementType": statement_type,
+                    "PerformanceType": performance_type,
+                    "Est_currency": ligne.get("Est_currency", ""),
+                    "Language": ligne.get("Language", ""),
+                    "Monthly_perf_history": ligne.get("Monthly_perf_history", ""),
+                    "Annual_perf_history": ligne.get("Annual_perf_history", ""),
+                    "Statut": "OK",
+                    "Erreur": ""
+                })
+            except Exception as e:
+                log(f"ERREUR sur {n_intv} : {e}")
+                resultats.append({
+                    "N_intv": n_intv,
+                    "Date": date_ligne,
+                    "StatementType": statement_type,
+                    "PerformanceType": performance_type,
+                    "Est_currency": ligne.get("Est_currency", ""),
+                    "Language": ligne.get("Language", ""),
+                    "Monthly_perf_history": ligne.get("Monthly_perf_history", ""),
+                    "Annual_perf_history": ligne.get("Annual_perf_history", ""),
+                    "Statut": "KO",
+                    "Erreur": str(e)[:300]
+                })
+            finally:
+                try:
+                    cliquer_clear_all_filters(page)
+                except Exception as e:
+                    log(f"ATTENTION : impossible de cliquer Clear all filters : {e}")
+
+        log(f"{nb_generes}/{len(rows_to_process)} génération(s) soumise(s) avec succès.")
+        fichiers = attendre_et_telecharger_fichiers(page, rows_generees, output_dir)
+        log("Traitement terminé.")
+
+    finally:
+        browser.close()
+
+    return nb_generes
+
+
+# ============================================================
+# Popup final avec choix
+# ============================================================
+def popup_fin_generation_choix(parent, nb_generes):
+    result = {"fermer": False}
+
+    top = tk.Toplevel(parent)
+    top.title("Génération terminée")
+    top.configure(bg="white")
+    top.resizable(False, False)
+    top.transient(parent)
+    top.grab_set()
+
+    largeur = 430
+    hauteur = 170
+    x = parent.winfo_rootx() + 120
+    y = parent.winfo_rooty() + 120
+    top.geometry(f"{largeur}x{hauteur}+{x}+{y}")
+
+    frame = tk.Frame(top, bg="white", padx=20, pady=20)
+    frame.pack(fill="both", expand=True)
+
+    tk.Label(
+        frame,
+        text=f"Les {nb_generes} reporting(s) ont été générés.",
+        bg="white",
+        fg=TEXT_DARK,
+        font=("Segoe UI", 11)
+    ).pack(anchor="w", pady=(0, 20))
+
+    btns = tk.Frame(frame, bg="white")
+    btns.pack(side="bottom", fill="x")
+
+    def rester():
+        result["fermer"] = False
+        top.destroy()
+
+    def fermer():
+        result["fermer"] = True
+        top.destroy()
+
+    tk.Button(
+        btns,
+        text="Rester sur cette page",
+        command=rester,
+        bg=WHITE,
+        fg=TEXT_DARK,
+        bd=1,
+        relief="solid"
+    ).pack(side="left")
+
+    tk.Button(
+        btns,
+        text="Fermer",
+        command=fermer,
+        bg=WHITE,
+        fg=TEXT_DARK,
+        bd=1,
+        relief="solid"
+    ).pack(side="right")
+
+    top.protocol("WM_DELETE_WINDOW", rester)
+    parent.wait_window(top)
+
+    return result["fermer"]
+
+
+# ============================================================
+# Interface Tkinter - 1 seule étape + presets
+# ============================================================
+def ouvrir_interface():
+    ut_code = get_ut_code()
+    config = charger_config()
+    output_dir_initial = charger_output_dir_pour_utilisateur(config, ut_code)
+
+    data_validee = False
+    df_courant = pd.DataFrame(columns=GUI_COLUMNS)
+
+    root = tk.Tk()
+    root.title("Cockpit - Paramètres de génération")
+    root.configure(bg="white")
+    root.geometry("1160x1020")
+    root.minsize(1080, 900)
+
+    try:
+        root.state("zoomed")
+    except Exception:
+        pass
+
+    style = ttk.Style()
+    try:
+        style.theme_use("clam")
+    except Exception:
+        pass
+
+    style.configure("TCombobox", padding=4)
+
+    var_perf = tk.StringVar(value=DEFAULT_GUI_VALUES["Performance_type"])
+    var_currency = tk.StringVar(value=DEFAULT_GUI_VALUES["Est_currency"])
+    var_lang = tk.StringVar(value=DEFAULT_GUI_VALUES["Language"])
+    var_monthly = tk.StringVar(value=DEFAULT_GUI_VALUES["Monthly_perf_history"])
+    var_annual = tk.StringVar(value=DEFAULT_GUI_VALUES["Annual_perf_history"])
+    var_anonymized = tk.BooleanVar(value=DEFAULT_GUI_VALUES["Anonymized_document"])
+    var_signature = tk.BooleanVar(value=DEFAULT_GUI_VALUES["Client_signature"])
+    var_output_dir = tk.StringVar(value=output_dir_initial)
+    var_preset = tk.StringVar(value="")
+
+    selected_statement = {"value": DEFAULT_GUI_VALUES["Statement_type"]}
+
+    lbl_status = None
+    btn_generate = None
+    btn_valider = None
+    btn_last_params = None
+    btn_save_preset = None
+    btn_delete_preset = None
+    btn_reset = None
+    cb_preset = None
+    date_entry = None
+    lbl_processing = None
+    progress_bar = None
+    txt_n_intv = None
+    info_var = tk.StringVar(value="0 Numéro(s) d'intervenant détecté(s)")
+    lbl_intro = None
+    lbl_output_state = None
+
+    dernier_etat_reference = {"value": None}
+    preset_precedent = {"value": ""}
+
+    def get_liste_n_intv():
+        contenu = txt_n_intv.get("1.0", "end")
+        return extraire_n_intv_depuis_texte(contenu)
+
+    def rafraichir_info_output():
+        chemin = var_output_dir.get().strip()
+        if not chemin:
+            lbl_output_state.config(
+                text="Aucun répertoire output sélectionné",
+                fg=RED
+            )
+            return
+
+        if os.path.isdir(chemin):
+            lbl_output_state.config(
+                text=f"Répertoire output : {chemin}",
+                fg=GREEN
+            )
+        else:
+            lbl_output_state.config(
+                text=f"Répertoire output invalide ou inaccessible : {chemin}",
+                fg=RED
+            )
+
+    def mettre_a_jour_compteur(*_):
+        liste = get_liste_n_intv()
+        info_var.set(f"{len(liste)} Numéro(s) d'intervenant détecté(s)")
+        if lbl_intro is not None:
+            lbl_intro.config(
+                text=f"{len(liste)} Numéro(s) d'intervenant seront traités. Les paramètres ci-dessous seront appliqués à tous."
+            )
+
+    def normalize_preset_payload(payload):
+        n_intv = payload.get("n_intv", [])
+        if not isinstance(n_intv, list):
+            n_intv = []
+
+        n_intv_norm = []
+        vus = set()
+        for n in n_intv:
+            nn = clean_n_intv(n)
+            if nn and nn not in vus:
+                vus.add(nn)
+                n_intv_norm.append(nn)
+
+        p = payload.get("params", {})
+        if not isinstance(p, dict):
+            p = {}
+
+        return {
+            "n_intv": n_intv_norm,
+            "params": {
+                "statement_type": str(p.get("statement_type", DEFAULT_GUI_VALUES["Statement_type"])).strip().upper(),
+                "currency": str(p.get("currency", DEFAULT_GUI_VALUES["Est_currency"])).strip(),
+                "language": str(p.get("language", DEFAULT_GUI_VALUES["Language"])).strip(),
+                "anonymized": bool(p.get("anonymized", DEFAULT_GUI_VALUES["Anonymized_document"])),
+                "signature": bool(p.get("signature", DEFAULT_GUI_VALUES["Client_signature"])),
+                "performance_type": str(p.get("performance_type", DEFAULT_GUI_VALUES["Performance_type"])).strip(),
+                "monthly_perf_history": str(p.get("monthly_perf_history", DEFAULT_GUI_VALUES["Monthly_perf_history"])).strip(),
+                "annual_perf_history": str(p.get("annual_perf_history", DEFAULT_GUI_VALUES["Annual_perf_history"])).strip(),
+                "output_path": str(p.get("output_path", "")).strip(),
+            }
+        }
+
+    def get_params_preset():
+        payload = {
+            "n_intv": get_liste_n_intv(),
+            "params": {
+                "statement_type": selected_statement["value"].strip().upper(),
+                "currency": var_currency.get().strip(),
+                "language": var_lang.get().strip(),
+                "anonymized": bool(var_anonymized.get()),
+                "signature": bool(var_signature.get()),
+                "performance_type": var_perf.get().strip(),
+                "monthly_perf_history": var_monthly.get().strip(),
+                "annual_perf_history": var_annual.get().strip(),
+                "output_path": var_output_dir.get().strip(),
+            }
+        }
+        return normalize_preset_payload(payload)
+
+    def sauvegarder_derniers_parametres():
+        payload = get_params_preset()
+        sauvegarder_last_params_pour_utilisateur(config, ut_code, payload)
+        sauvegarder_config(config)
+        log(f"Derniers paramètres sauvegardés pour {ut_code}")
+
+    def set_reference_state():
+        dernier_etat_reference["value"] = get_params_preset()
+
+    def formulaire_modifie_depuis_reference():
+        ref = dernier_etat_reference["value"]
+        if ref is None:
+            return False
+        return get_params_preset() != ref
+
+    def mark_dirty(*_):
+        nonlocal data_validee
+        data_validee = False
+        if lbl_status is not None:
+            lbl_status.config(text="", fg=GREEN)
+        if btn_generate is not None:
+            btn_generate.config(state="disabled")
+        rafraichir_info_output()
+
+    def on_n_intv_change(event=None):
+        mettre_a_jour_compteur()
+        mark_dirty()
+
+    def set_statement(name):
+        selected_statement["value"] = name
+        refresh_statement_buttons()
+        mark_dirty()
+
+    def refresh_statement_buttons():
+        mapping = {
+            "STANDARD": btn_standard,
+            "FULL": btn_full,
+            "LIGHT": btn_light,
+        }
+        for name, btn in mapping.items():
+            if selected_statement["value"] == name:
+                btn.config(bg=BLUE, fg=WHITE, activebackground=BLUE, activeforeground=WHITE)
+            else:
+                btn.config(bg=WHITE, fg=TEXT_DARK, activebackground="#efefef", activeforeground=TEXT_DARK)
+
+    def update_delete_button():
+        etat = "normal" if var_preset.get().strip() else "disabled"
+        btn_delete_preset.config(state=etat)
+
+    def refresh_preset_combo(select=""):
+        presets = get_presets_pour_utilisateur(config, ut_code)
+        noms = sorted(presets.keys(), key=lambda s: s.lower())
+        cb_preset["values"] = noms
+        var_preset.set(select if select in noms else "")
+        preset_precedent["value"] = var_preset.get()
+        update_delete_button()
+
+    def get_date_value():
+        try:
+            return date_entry.get_date().strftime("%d.%m.%Y")
+        except Exception:
+            txt = date_entry.get().strip()
+            return normaliser_date(txt)
+
+    def set_today():
+        date_entry.set_date(datetime.today())
+        mark_dirty()
+
+    def choisir_output_dir():
+        initialdir = var_output_dir.get().strip() or str(Path.home())
+        dossier = filedialog.askdirectory(
+            title="Choisir le répertoire output",
+            initialdir=initialdir
+        )
+        if not dossier:
+            return
+
+        var_output_dir.set(dossier)
+
+        try:
+            sauvegarder_output_dir_pour_utilisateur(config, ut_code, dossier)
+            sauvegarder_config(config)
+            log(f"Répertoire output sauvegardé immédiatement pour {ut_code} : {dossier}")
+        except Exception as e:
+            messagebox.showerror(
+                "Erreur",
+                f"Impossible d'enregistrer le répertoire output dans le JSON : {e}"
+            )
+
+        rafraichir_info_output()
+        mark_dirty()
+
+    def construire_df_depuis_ui():
+        liste_n_intv = get_liste_n_intv()
+
+        if not liste_n_intv:
+            raise ValueError("Merci de saisir, coller ou charger au moins un Numéro d'intervenant.")
+
+        chemin_output = var_output_dir.get().strip()
+        if not chemin_output:
+            raise ValueError("Merci de choisir un répertoire output.")
+        if not os.path.isdir(chemin_output):
+            raise ValueError("Le répertoire output sélectionné est introuvable ou inaccessible.")
+
+        df_local = construire_dataframe_depuis_n_intv(liste_n_intv, date_defaut=get_date_value())
+
+        for idx in df_local.index:
+            df_local.at[idx, "Date"] = get_date_value()
+            df_local.at[idx, "Statement_type"] = selected_statement["value"].strip().upper()
+            df_local.at[idx, "Performance_type"] = var_perf.get().strip()
+            df_local.at[idx, "Est_currency"] = var_currency.get().strip()
+            df_local.at[idx, "Language"] = var_lang.get().strip()
+            df_local.at[idx, "Monthly_perf_history"] = var_monthly.get().strip()
+            df_local.at[idx, "Annual_perf_history"] = var_annual.get().strip()
+            df_local.at[idx, "Anonymized_document"] = bool(var_anonymized.get())
+            df_local.at[idx, "Client_signature"] = bool(var_signature.get())
+
+        return df_local
+
+    def appliquer_preset_sur_formulaire(preset):
+        txt_n_intv.delete("1.0", "end")
+        txt_n_intv.insert("1.0", "\n".join(preset.get("n_intv", [])))
+
+        params = preset.get("params", {})
+
+        selected_statement["value"] = str(
+            params.get("statement_type", DEFAULT_GUI_VALUES["Statement_type"])
+        ).strip().upper() or DEFAULT_GUI_VALUES["Statement_type"]
+        refresh_statement_buttons()
+
+        var_currency.set(str(params.get("currency", DEFAULT_GUI_VALUES["Est_currency"])).strip() or DEFAULT_GUI_VALUES["Est_currency"])
+        var_lang.set(str(params.get("language", DEFAULT_GUI_VALUES["Language"])).strip() or DEFAULT_GUI_VALUES["Language"])
+        var_anonymized.set(bool(params.get("anonymized", DEFAULT_GUI_VALUES["Anonymized_document"])))
+        var_signature.set(bool(params.get("signature", DEFAULT_GUI_VALUES["Client_signature"])))
+        var_perf.set(str(params.get("performance_type", DEFAULT_GUI_VALUES["Performance_type"])).strip() or DEFAULT_GUI_VALUES["Performance_type"])
+        var_monthly.set(str(params.get("monthly_perf_history", DEFAULT_GUI_VALUES["Monthly_perf_history"])).strip() or DEFAULT_GUI_VALUES["Monthly_perf_history"])
+        var_annual.set(str(params.get("annual_perf_history", DEFAULT_GUI_VALUES["Annual_perf_history"])).strip() or DEFAULT_GUI_VALUES["Annual_perf_history"])
+
+        output_path_preset = str(params.get("output_path", "")).strip()
+        if output_path_preset:
+            if os.path.isdir(output_path_preset):
+                var_output_dir.set(output_path_preset)
+            else:
+                messagebox.showwarning(
+                    "Répertoire introuvable",
+                    f"Le répertoire du paramétrage n'existe plus :\n{output_path_preset}\n\nLe répertoire output actuel est conservé."
+                )
+
+        mettre_a_jour_compteur()
+        rafraichir_info_output()
+        mark_dirty()
+
+    def charger_derniers_parametres_ui():
+        last_params = charger_last_params_pour_utilisateur(config, ut_code)
+
+        if not isinstance(last_params, dict) or not last_params:
+            messagebox.showinfo(
+                "Derniers paramètres",
+                "Aucun dernier paramétrage n'est disponible pour cet utilisateur."
+            )
+            return
+
+        if formulaire_modifie_depuis_reference():
+            ok = messagebox.askyesno(
+                "Charger les derniers paramètres",
+                "Le formulaire contient des modifications non enregistrées.\n"
+                "Charger les derniers paramètres quand même ?"
+            )
+            if not ok:
+                return
+
+        appliquer_preset_sur_formulaire(normalize_preset_payload(last_params))
+        var_preset.set("")
+        preset_precedent["value"] = ""
+        update_delete_button()
+        set_reference_state()
+
+        lbl_status.config(text="✓ Derniers paramètres chargés", fg=GREEN)
+        log(f"Derniers paramètres chargés pour {ut_code}")
+
+    def valider_formulaire(afficher_message_succes=True):
+        nonlocal data_validee, df_courant
+        try:
+            df_courant = construire_df_depuis_ui()
+
+            chemin_output = var_output_dir.get().strip()
+            sauvegarder_output_dir_pour_utilisateur(config, ut_code, chemin_output)
+
+            payload = get_params_preset()
+            sauvegarder_last_params_pour_utilisateur(config, ut_code, payload)
+
+            sauvegarder_config(config)
+
+        except Exception as e:
+            messagebox.showerror("Erreur", f"Validation impossible : {e}")
+            return False
+
+        data_validee = True
+
+        if afficher_message_succes:
+            lbl_status.config(
+                text=f"✓ Data validée ({len(df_courant)} numéro(s) d'intervenant) | UT : {ut_code}",
+                fg=GREEN
+            )
+
+        btn_generate.config(state="normal")
+        log(
+            f"DataFrame validé en mémoire. Output dir + derniers paramètres sauvegardés pour "
+            f"{ut_code} : {var_output_dir.get().strip()}"
+        )
+        return True
+
+    def desactiver_boutons_traitement():
+        btn_valider.config(state="disabled")
+        btn_generate.config(state="disabled")
+        btn_last_params.config(state="disabled")
+        btn_save_preset.config(state="disabled")
+        btn_delete_preset.config(state="disabled")
+        btn_reset.config(state="disabled")
+        cb_preset.config(state="disabled")
+
+    def reactiver_boutons_apres_traitement():
+        btn_valider.config(state="normal")
+        btn_generate.config(state="normal" if data_validee else "disabled")
+        btn_last_params.config(state="normal")
+        btn_save_preset.config(state="normal")
+        cb_preset.config(state="readonly")
+        update_delete_button()
+
+    def afficher_traitement():
+        lbl_processing.config(text="Traitement en cours...")
+        progress_bar.pack(side="left", padx=(0, 10))
+        progress_bar.start(12)
+
+    def masquer_traitement():
+        progress_bar.stop()
+        progress_bar.pack_forget()
+        lbl_processing.config(text="")
+
+    def coller_presse_papier():
+        try:
+            contenu = root.clipboard_get()
+            txt_n_intv.delete("1.0", "end")
+            txt_n_intv.insert("1.0", contenu)
+            on_n_intv_change()
+        except Exception as e:
+            messagebox.showerror("Presse-papier", f"Impossible de lire le presse-papier : {e}")
+
+    def charger_fichier():
+        chemin = filedialog.askopenfilename(
+            title="Choisir un fichier Excel",
+            filetypes=[("Fichiers Excel", "*.xlsx *.xls")]
+        )
+        if not chemin:
+            return
+
+        try:
+            liste = charger_n_intv_depuis_xlsx(chemin)
+            if not liste:
+                messagebox.showwarning("Fichier vide", "Aucun Numéro d'intervenant exploitable n'a été trouvé dans le fichier.")
+                return
+
+            txt_n_intv.delete("1.0", "end")
+            txt_n_intv.insert("1.0", "\n".join(liste))
+            on_n_intv_change()
+        except Exception as e:
+            messagebox.showerror("Erreur fichier", str(e))
+
+    def valider():
+        valider_formulaire(afficher_message_succes=True)
+
+    def enregistrer_preset():
+        if not valider_formulaire(afficher_message_succes=False):
+            return
+
+        nom = simpledialog.askstring("Enregistrer paramétrage", "Nom du paramétrage :", parent=root)
+        if nom is None:
+            return
+
+        nom = nom.strip()
+        if not nom:
+            return
+
+        presets = get_presets_pour_utilisateur(config, ut_code)
+
+        if nom in presets:
+            if not messagebox.askyesno("Paramétrage existant", f"« {nom} » existe déjà. Remplacer ?"):
+                return
+
+        presets[nom] = get_params_preset()
+        sauvegarder_config(config)
+        refresh_preset_combo(select=nom)
+        set_reference_state()
+        lbl_status.config(text=f"✓ Preset enregistré : {nom}", fg=GREEN)
+        log(f"Preset enregistré pour {ut_code} : {nom}")
+
+    def charger_preset(event=None):
+        nom = var_preset.get().strip()
+        if not nom:
+            update_delete_button()
+            preset_precedent["value"] = ""
+            return
+
+        if formulaire_modifie_depuis_reference():
+            ok = messagebox.askyesno(
+                "Charger un paramétrage",
+                "Le formulaire contient des modifications non enregistrées.\nCharger le paramétrage quand même ?"
+            )
+            if not ok:
+                var_preset.set(preset_precedent["value"])
+                update_delete_button()
+                return
+
+        preset = get_presets_pour_utilisateur(config, ut_code).get(nom)
+        if not isinstance(preset, dict):
+            messagebox.showerror("Preset", f"Impossible de charger le paramétrage « {nom} ».")
+            var_preset.set(preset_precedent["value"])
+            update_delete_button()
+            return
+
+        appliquer_preset_sur_formulaire(normalize_preset_payload(preset))
+        preset_precedent["value"] = nom
+        set_reference_state()
+        update_delete_button()
+        lbl_status.config(text=f"✓ Paramétrage chargé : {nom}", fg=GREEN)
+
+    def supprimer_preset():
+        nom = var_preset.get().strip()
+        if not nom:
+            return
+
+        if not messagebox.askyesno("Supprimer", f"Supprimer « {nom} » ?"):
+            return
+
+        presets = get_presets_pour_utilisateur(config, ut_code)
+        presets.pop(nom, None)
+        sauvegarder_config(config)
+        refresh_preset_combo(select="")
+        lbl_status.config(text=f"✓ Paramétrage supprimé : {nom}", fg=GREEN)
+        log(f"Paramétrage supprimé pour {ut_code} : {nom}")
+
+    def reset_formulaire():
+        if formulaire_modifie_depuis_reference():
+            ok = messagebox.askyesno(
+                "Reset",
+                "Le formulaire contient des modifications non enregistrées.\nRéinitialiser quand même ?"
+            )
+            if not ok:
+                return
+
+        txt_n_intv.delete("1.0", "end")
+
+        selected_statement["value"] = DEFAULT_GUI_VALUES["Statement_type"]
+        refresh_statement_buttons()
+
+        var_perf.set(DEFAULT_GUI_VALUES["Performance_type"])
+        var_currency.set(DEFAULT_GUI_VALUES["Est_currency"])
+        var_lang.set(DEFAULT_GUI_VALUES["Language"])
+        var_monthly.set(DEFAULT_GUI_VALUES["Monthly_perf_history"])
+        var_annual.set(DEFAULT_GUI_VALUES["Annual_perf_history"])
+        var_anonymized.set(DEFAULT_GUI_VALUES["Anonymized_document"])
+        var_signature.set(DEFAULT_GUI_VALUES["Client_signature"])
+
+        try:
+            date_entry.set_date(datetime.today())
+        except Exception:
+            pass
+
+        var_preset.set("")
+        preset_precedent["value"] = ""
+        update_delete_button()
+
+        mettre_a_jour_compteur()
+        rafraichir_info_output()
+        mark_dirty()
+
+        set_reference_state()
+
+        lbl_status.config(text="✓ Formulaire réinitialisé", fg=GREEN)
+
+    def generer():
+        nonlocal df_courant
+        if not data_validee:
+            messagebox.showwarning("Validation requise", "Merci de cliquer d'abord sur VALIDER.")
+            return
+
+        try:
+            df_courant = construire_df_depuis_ui()
+            chemin_output = var_output_dir.get().strip()
+
+            if not os.path.isdir(chemin_output):
+                raise ValueError("Le répertoire output n'est plus accessible.")
+
+            sauvegarder_output_dir_pour_utilisateur(config, ut_code, chemin_output)
+
+            payload = get_params_preset()
+            sauvegarder_last_params_pour_utilisateur(config, ut_code, payload)
+
+            sauvegarder_config(config)
+
+        except Exception as e:
+            messagebox.showerror("Erreur", f"Préparation impossible : {e}")
+            return
+
+        desactiver_boutons_traitement()
+        afficher_traitement()
+        root.update_idletasks()
+        root.update()
+
+        try:
+            with sync_playwright() as playwright:
+                nb = run(playwright, df_courant, chemin_output)
+
+            masquer_traitement()
+
+            fermer_robot = popup_fin_generation_choix(root, nb)
+
+            if fermer_robot:
+                root.destroy()
+            else:
+                reactiver_boutons_apres_traitement()
+                lbl_status.config(
+                    text=f"✓ Dernière génération terminée ({nb} reporting(s))",
+                    fg=GREEN
+                )
+
+        except Exception as e:
+            masquer_traitement()
+            reactiver_boutons_apres_traitement()
+            messagebox.showerror("Erreur", f"Erreur pendant le traitement : {e}")
+
+    for v in [var_perf, var_currency, var_lang, var_monthly, var_annual]:
+        v.trace_add("write", mark_dirty)
+    var_anonymized.trace_add("write", mark_dirty)
+    var_signature.trace_add("write", mark_dirty)
+    var_output_dir.trace_add("write", mark_dirty)
+
+    top = tk.Frame(root, bg="white", padx=15, pady=15)
+    top.pack(fill="x")
+
+    tk.Label(
+        top,
+        text="Cockpit - Paramètres de génération",
+        bg="white",
+        fg=TEXT_DARK,
+        font=("Segoe UI", 16, "bold")
+    ).pack(anchor="w")
+
+    lbl_intro = tk.Label(
+        top,
+        text="0 Numéro(s) d'intervenant seront traités. Les paramètres ci-dessous seront appliqués à tous.",
+        bg="white",
+        fg=GRAY,
+        font=("Segoe UI", 10)
+    )
+    lbl_intro.pack(anchor="w", pady=(6, 0))
+
+    preset_row = tk.Frame(root, bg="white", padx=15, pady=0)
+    preset_row.pack(fill="x", pady=(0, 10))
+
+    tk.Label(
+        preset_row,
+        text="Paramétrage :",
+        bg="white",
+        fg=TEXT_DARK,
+        font=("Segoe UI", 10)
+    ).pack(side="left")
+
+    cb_preset = ttk.Combobox(
+        preset_row,
+        textvariable=var_preset,
+        state="readonly",
+        width=30
+    )
+    cb_preset.pack(side="left", padx=(8, 8))
+    cb_preset.bind("<<ComboboxSelected>>", charger_preset)
+
+    btn_last_params = tk.Button(
+        preset_row,
+        text="Derniers paramètres",
+        command=charger_derniers_parametres_ui,
+        bg=WHITE,
+        fg=TEXT_DARK,
+        bd=1,
+        relief="solid"
+    )
+    btn_last_params.pack(side="left", padx=(0, 8))
+
+    btn_save_preset = tk.Button(
+        preset_row,
+        text="Enregistrer paramétrage",
+        command=enregistrer_preset,
+        bg=WHITE,
+        fg=TEXT_DARK,
+        bd=1,
+        relief="solid"
+    )
+    btn_save_preset.pack(side="left")
+
+    btn_delete_preset = tk.Button(
+        preset_row,
+        text="Supprimer",
+        command=supprimer_preset,
+        bg=WHITE,
+        fg=TEXT_DARK,
+        bd=1,
+        relief="solid",
+        state="disabled"
+    )
+    btn_delete_preset.pack(side="left", padx=(8, 0))
+
+    btn_reset = tk.Button(
+        preset_row,
+        text="Reset",
+        command=reset_formulaire,
+        bg=WHITE,
+        fg=TEXT_DARK,
+        bd=1,
+        relief="solid"
+    )
+    btn_reset.pack(side="left", padx=(8, 0))
+
+    zone_frame = tk.LabelFrame(
+        root,
+        text="Liste des Numéros d'intervenant",
+        bg="white",
+        fg=TEXT_DARK,
+        padx=12,
+        pady=12
+    )
+    zone_frame.pack(fill="both", padx=15, pady=(0, 10))
+
+    txt_n_intv = tk.Text(zone_frame, height=8, wrap="word", font=("Consolas", 11), bd=1, relief="solid")
+    txt_n_intv.pack(fill="both", expand=True)
+    txt_n_intv.bind("<KeyRelease>", on_n_intv_change)
+
+    footer_zone = tk.Frame(zone_frame, bg="white")
+    footer_zone.pack(fill="x", pady=(10, 0))
+
+    tk.Label(
+        footer_zone,
+        textvariable=info_var,
+        bg="white",
+        fg=GREEN,
+        font=("Segoe UI", 10, "bold")
+    ).pack(side="left")
+
+    btns_zone = tk.Frame(footer_zone, bg="white")
+    btns_zone.pack(side="right")
+
+    tk.Button(
+        btns_zone,
+        text="Coller depuis le presse-papier",
+        command=coller_presse_papier,
+        bg=WHITE,
+        fg=TEXT_DARK,
+        bd=1,
+        relief="solid"
+    ).pack(side="left")
+
+    tk.Button(
+        btns_zone,
+        text="Charger un fichier Excel",
+        command=charger_fichier,
+        bg=WHITE,
+        fg=TEXT_DARK,
+        bd=1,
+        relief="solid"
+    ).pack(side="left", padx=(8, 0))
+
+    output_frame = tk.LabelFrame(
+        root,
+        text="Répertoire output",
+        bg="white",
+        fg=TEXT_DARK,
+        padx=12,
+        pady=12
+    )
+    output_frame.pack(fill="x", padx=15, pady=(0, 10))
+
+    output_top = tk.Frame(output_frame, bg="white")
+    output_top.pack(fill="x")
+
+    tk.Button(
+        output_top,
+        text="Choisir un répertoire",
+        command=choisir_output_dir,
+        bg=WHITE,
+        fg=TEXT_DARK,
+        bd=1,
+        relief="solid"
+    ).pack(side="right")
+
+    tk.Label(
+        output_top,
+        text=f"Utilisateur détecté : {ut_code}",
+        bg="white",
+        fg=GRAY,
+        font=("Segoe UI", 10)
+    ).pack(side="left")
+
+    lbl_output_state = tk.Label(
+        output_frame,
+        text="Aucun répertoire output sélectionné",
+        bg="white",
+        fg=RED,
+        justify="left",
+        wraplength=1000,
+        font=("Segoe UI", 10, "bold")
+    )
+    lbl_output_state.pack(anchor="w", pady=(10, 0))
+
+    main = tk.Frame(root, bg="white", padx=15, pady=5)
+    main.pack(fill="both", expand=True)
+
+    stmt_frame = tk.Frame(main, bg="white")
+    stmt_frame.pack(fill="x", pady=(0, 10))
+
+    tk.Label(
+        stmt_frame,
+        text="Statement Type *",
+        bg="white",
+        fg=TEXT_DARK,
+        font=("Segoe UI", 10, "bold")
+    ).pack(anchor="w")
+
+    stmt_buttons = tk.Frame(stmt_frame, bg="white")
+    stmt_buttons.pack(anchor="w", pady=(8, 0))
+
+    btn_standard = tk.Button(
+        stmt_buttons, text="STANDARD", width=12, bd=1, relief="solid",
+        command=lambda: set_statement("STANDARD")
+    )
+    btn_standard.pack(side="left", padx=(0, 8))
+
+    btn_full = tk.Button(
+        stmt_buttons, text="FULL", width=12, bd=1, relief="solid",
+        command=lambda: set_statement("FULL")
+    )
+    btn_full.pack(side="left", padx=(0, 8))
+
+    btn_light = tk.Button(
+        stmt_buttons, text="LIGHT", width=12, bd=1, relief="solid",
+        command=lambda: set_statement("LIGHT")
+    )
+    btn_light.pack(side="left")
+
+    body = tk.Frame(main, bg="white")
+    body.pack(fill="both", expand=True)
+
+    left = tk.LabelFrame(body, text="GLOBAL STATEMENT PARAMETERS", bg="white", fg=TEXT_DARK, padx=12, pady=12)
+    left.pack(side="left", fill="both", expand=True, padx=(0, 8))
+
+    right = tk.LabelFrame(body, text="OPTIONS", bg="white", fg=TEXT_DARK, padx=12, pady=12)
+    right.pack(side="left", fill="both", expand=True, padx=(8, 0))
+
+    tk.Label(left, text="Date", bg="white", fg=TEXT_DARK).grid(row=0, column=0, sticky="w")
+    date_frame = tk.Frame(left, bg="white")
+    date_frame.grid(row=1, column=0, sticky="we", pady=(0, 10))
+
+    date_entry = DateEntry(
+        date_frame,
+        date_pattern="dd.mm.yyyy",
+        width=22,
+        background=BLUE,
+        foreground="white",
+        borderwidth=1
+    )
+    date_entry.pack(side="left", fill="x", expand=True)
+    date_entry.set_date(datetime.today())
+    date_entry.bind("<<DateEntrySelected>>", mark_dirty)
+
+    tk.Button(
+        date_frame,
+        text="Today",
+        command=set_today,
+        bg=WHITE,
+        fg=TEXT_DARK,
+        bd=1,
+        relief="solid"
+    ).pack(side="left", padx=(8, 0))
+
+    tk.Label(left, text="Estimation currency", bg="white", fg=TEXT_DARK).grid(row=2, column=0, sticky="w")
+    ttk.Combobox(left, textvariable=var_currency, values=LISTE_EST_CURRENCY, state="readonly", width=27).grid(
+        row=3, column=0, sticky="we", pady=(0, 10)
+    )
+
+    tk.Label(left, text="Language", bg="white", fg=TEXT_DARK).grid(row=4, column=0, sticky="w")
+    ttk.Combobox(left, textvariable=var_lang, values=LISTE_LANGUAGE, state="readonly", width=27).grid(
+        row=5, column=0, sticky="we", pady=(0, 10)
+    )
+
+    tk.Checkbutton(
+        left,
+        text="Anonymized document",
+        variable=var_anonymized,
+        bg="white",
+        fg=TEXT_DARK,
+        activebackground="white",
+        activeforeground=TEXT_DARK,
+        selectcolor="white"
+    ).grid(row=6, column=0, sticky="w", pady=(4, 4))
+
+    tk.Checkbutton(
+        left,
+        text="Client Signature",
+        variable=var_signature,
+        bg="white",
+        fg=TEXT_DARK,
+        activebackground="white",
+        activeforeground=TEXT_DARK,
+        selectcolor="white"
+    ).grid(row=7, column=0, sticky="w", pady=(0, 10))
+
+    left.grid_columnconfigure(0, weight=1)
+
+    tk.Label(right, text="Performance type", bg="white", fg=TEXT_DARK).grid(row=0, column=0, sticky="w")
+    ttk.Combobox(right, textvariable=var_perf, values=LISTE_PERFORMANCE_TYPE, state="readonly", width=27).grid(
+        row=1, column=0, sticky="we", pady=(0, 10)
+    )
+
+    tk.Label(right, text="Monthly perf history", bg="white", fg=TEXT_DARK).grid(row=2, column=0, sticky="w")
+    ttk.Combobox(right, textvariable=var_monthly, values=LISTE_MONTHLY, state="readonly", width=27).grid(
+        row=3, column=0, sticky="we", pady=(0, 10)
+    )
+
+    tk.Label(right, text="Annual perf history", bg="white", fg=TEXT_DARK).grid(row=4, column=0, sticky="w")
+    ttk.Combobox(right, textvariable=var_annual, values=LISTE_ANNUAL, state="readonly", width=27).grid(
+        row=5, column=0, sticky="we", pady=(0, 10)
+    )
+
+    tk.Label(
+        right,
+        text="Le File Name est généré automatiquement par le robot.",
+        bg="white",
+        fg=GRAY
+    ).grid(row=6, column=0, sticky="w", pady=(8, 0))
+
+    right.grid_columnconfigure(0, weight=1)
+
+    bottom = tk.Frame(root, bg="white", padx=15, pady=15)
+    bottom.pack(fill="x")
+
+    status_frame = tk.Frame(bottom, bg="white")
+    status_frame.pack(side="left")
+
+    lbl_status = tk.Label(status_frame, text="", bg="white", fg=GREEN, font=("Segoe UI", 10, "bold"))
+    lbl_status.pack(side="left", padx=(0, 20))
+
+    lbl_processing = tk.Label(
+        status_frame,
+        text="",
+        bg="white",
+        fg=GRAY,
+        font=("Segoe UI", 10, "italic")
+    )
+    lbl_processing.pack(side="left")
+
+    progress_bar = ttk.Progressbar(
+        status_frame,
+        mode="indeterminate",
+        length=160
+    )
+
+    btn_generate = tk.Button(
+        bottom,
+        text="GENERER",
+        command=generer,
+        bg=WHITE,
+        fg=TEXT_DARK,
+        bd=1,
+        relief="solid",
+        state="disabled"
+    )
+    btn_generate.pack(side="right")
+
+    btn_valider = tk.Button(
+        bottom,
+        text="VALIDER",
+        command=valider,
+        bg=WHITE,
+        fg=TEXT_DARK,
+        bd=1,
+        relief="solid"
+    )
+    btn_valider.pack(side="right", padx=(0, 12))
+
+    refresh_statement_buttons()
+    mettre_a_jour_compteur()
+    rafraichir_info_output()
+    refresh_preset_combo(select="")
+    set_reference_state()
+    root.mainloop()
+
+
+# ============================================================
+# Main
+# ============================================================
+if __name__ == "__main__":
+    ouvrir_interface()
