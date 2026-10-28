@@ -37,58 +37,44 @@ FICHIER_EXCEL = os.path.join(
 
 
 # ============================================================
-# COLONNES
+# COLONNES : PILOTEES PAR input.xlsx
 # ============================================================
 
-ENTETES_PAR_DEFAUT = [
-    "Type",
-    "Référence",
-    "Résumé",
-    "Responsable",
-    "État",
-    "Création",
-    "URL IWM",
-    "Descriptif",
-    "Temps écoulé pour la résolution",
-    "Request participants",
-    "Rapporteur",
-    "Mise à jour",
-    "Projet de service",
-]
+# Fichier de paramétrage des colonnes (par défaut : à côté du script).
+INPUT_COLONNES = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "input.xlsx"
+)
 
-ALIAS_TYPE = ["Type"]
-ALIAS_REFERENCE = ["Référence", "Reference", "Réf", "Ref", "Clé", "Key"]
-ALIAS_URL_IWM = ["URL IWM"]
-ALIAS_CREATION = ["Création", "Creation", "Créé le", "Created"]
-ALIAS_MISE_A_JOUR = ["Mise à jour", "Mise a jour", "Updated"]
+ONGLET_COLONNES = "Colonnes"
 
-LARGEURS_COLONNES = {
-    "Type": 18,
-    "Référence": 18,
-    "Résumé": 45,
-    "Responsable": 30,
-    "État": 25,
-    "Création": 20,
-    "URL IWM": 43,
-    "Descriptif": 75,
-    "Temps écoulé pour la résolution": 32,
-    "Request participants": 35,
-    "Rapporteur": 30,
-    "Mise à jour": 20,
-    "Projet de service": 25,
+# En-têtes attendus dans l'onglet "Colonnes" (casse et accents ignorés).
+ENTETE_LIBELLE = "Libellé Jira"
+ENTETE_EXPORTER = "Exporter"
+ENTETE_ORDRE = "Ordre"
+ENTETE_LARGEUR = "Largeur"
+ENTETE_FORMAT = "Format"
+
+# Valeurs autorisées dans la colonne "Format".
+FORMAT_TEXTE = "texte"
+FORMAT_DATE = "date"
+FORMAT_LIEN = "lien"
+FORMAT_ICONE = "icone"
+FORMAT_REFERENCE = "reference"
+
+FORMATS_VALIDES = {
+    FORMAT_TEXTE,
+    FORMAT_DATE,
+    FORMAT_LIEN,
+    FORMAT_ICONE,
+    FORMAT_REFERENCE,
 }
 
 LARGEUR_PAR_DEFAUT = 20
 
-# Colonnes à cocher avant le scroll / la pagination.
-COLONNES_A_SELECTIONNER = [
-    "Création",
-    "URL IWM",
-    "Descriptif",
-    "Temps écoulé pour la résolution",
-    "Request participants",
-    "Mise à jour",
-]
+# Pause après chaque scroll (secondes). 0.2 suffit : le scroll JS est
+# immédiat, la pause sert seulement à voir le mouvement à l'écran.
+PAUSE_SCROLL = 0.2
 
 
 # ============================================================
@@ -182,6 +168,155 @@ def convertir_url_absolue(page, url: str) -> str:
         return ""
 
     return urljoin(page.url, url)
+
+
+# ============================================================
+# LECTURE DE input.xlsx
+# ============================================================
+
+def charger_config_colonnes(chemin: str = INPUT_COLONNES) -> list[dict]:
+    """
+    Lit l'onglet "Colonnes" de input.xlsx et renvoie les colonnes
+    à exporter, triées par Ordre :
+        [{"libelle": "Référence", "largeur": 18, "format": "reference"}, ...]
+    """
+    if not os.path.exists(chemin):
+        raise RuntimeError(f"Fichier de paramétrage introuvable : {chemin}")
+
+    try:
+        brut = pd.read_excel(
+            chemin,
+            sheet_name=ONGLET_COLONNES,
+            dtype=object
+        )
+    except ValueError:
+        raise RuntimeError(
+            f"Onglet « {ONGLET_COLONNES} » introuvable dans {chemin}."
+        )
+
+    # Repérage des colonnes de l'onglet par nom (casse/accents ignorés).
+    noms_onglet = {normaliser(nom): nom for nom in brut.columns}
+    attendus = [
+        ENTETE_LIBELLE,
+        ENTETE_EXPORTER,
+        ENTETE_ORDRE,
+        ENTETE_LARGEUR,
+        ENTETE_FORMAT,
+    ]
+    manquants = [e for e in attendus if normaliser(e) not in noms_onglet]
+
+    if manquants:
+        raise RuntimeError(
+            f"Colonne(s) manquante(s) dans l'onglet « {ONGLET_COLONNES} » : "
+            f"{manquants}"
+        )
+
+    def valeur(ligne, entete):
+        return ligne[noms_onglet[normaliser(entete)]]
+
+    def est_vide(v) -> bool:
+        return v is None or (not isinstance(v, str) and pd.isna(v)) \
+            or nettoyer_texte(v) == ""
+
+    config = []
+    erreurs = []
+
+    for numero, ligne in brut.iterrows():
+        numero_excel = numero + 2
+        libelle = valeur(ligne, ENTETE_LIBELLE)
+
+        if est_vide(libelle):
+            continue
+
+        libelle = nettoyer_texte(libelle)
+        exporter = normaliser(valeur(ligne, ENTETE_EXPORTER))
+
+        if exporter in ("non", "n", "no", "false", "0"):
+            continue
+
+        if exporter not in ("oui", "o", "yes", "y", "true", "1"):
+            erreurs.append(
+                f"ligne {numero_excel} ({libelle}) : Exporter doit valoir "
+                "Oui ou Non"
+            )
+            continue
+
+        ordre = valeur(ligne, ENTETE_ORDRE)
+
+        try:
+            ordre = int(float(ordre))
+        except (TypeError, ValueError):
+            erreurs.append(
+                f"ligne {numero_excel} ({libelle}) : Ordre doit être un nombre"
+            )
+            continue
+
+        largeur = valeur(ligne, ENTETE_LARGEUR)
+
+        try:
+            largeur = (
+                LARGEUR_PAR_DEFAUT if est_vide(largeur)
+                else float(largeur)
+            )
+        except (TypeError, ValueError):
+            erreurs.append(
+                f"ligne {numero_excel} ({libelle}) : "
+                "Largeur doit être un nombre"
+            )
+            continue
+
+        format_colonne = valeur(ligne, ENTETE_FORMAT)
+        format_colonne = (
+            FORMAT_TEXTE if est_vide(format_colonne)
+            else normaliser(format_colonne)
+        )
+
+        if format_colonne not in FORMATS_VALIDES:
+            erreurs.append(
+                f"ligne {numero_excel} ({libelle}) : Format « "
+                f"{format_colonne} » inconnu (valeurs : texte, date, lien, "
+                "icône, référence)"
+            )
+            continue
+
+        config.append(
+            {
+                "libelle": libelle,
+                "ordre": ordre,
+                "largeur": largeur,
+                "format": format_colonne,
+            }
+        )
+
+    nb_references = sum(
+        1 for c in config if c["format"] == FORMAT_REFERENCE
+    )
+
+    if nb_references != 1:
+        erreurs.append(
+            "il faut exactement une colonne exportée au Format « référence » "
+            f"({nb_references} trouvée(s))"
+        )
+
+    libelles = [normaliser(c["libelle"]) for c in config]
+    doublons = sorted({l for l in libelles if libelles.count(l) > 1})
+
+    if doublons:
+        erreurs.append(f"libellé(s) en double : {doublons}")
+
+    if erreurs:
+        raise RuntimeError(
+            "input.xlsx invalide :\n  - " + "\n  - ".join(erreurs)
+        )
+
+    config.sort(key=lambda c: c["ordre"])
+
+    log(
+        f"{len(config)} colonne(s) à exporter lue(s) dans input.xlsx : "
+        + ", ".join(c["libelle"] for c in config)
+    )
+
+    return config
 
 
 # ============================================================
@@ -341,7 +476,7 @@ def enregistrer_colonnes(page) -> None:
     log("Fenêtre 'Colonnes' fermée après enregistrement.")
 
 
-def configurer_colonnes_avant_scroll(page) -> None:
+def configurer_colonnes_avant_scroll(page, libelles: list[str]) -> None:
     """
     Séquence avant scroll :
       1. cliquer sur Modifier les colonnes
@@ -354,7 +489,7 @@ def configurer_colonnes_avant_scroll(page) -> None:
 
     ouvrir_fenetre_colonnes(page)
 
-    for libelle in COLONNES_A_SELECTIONNER:
+    for libelle in libelles:
         rechercher_et_cocher_colonne(page, libelle)
 
     enregistrer_colonnes(page)
@@ -727,7 +862,7 @@ def descendre_jusqu_a_pagination(page) -> None:
         position="bottom"
     )
 
-    time.sleep(1)
+    time.sleep(PAUSE_SCROLL)
 
 
 def remonter_au_tableau(page, table) -> None:
@@ -744,7 +879,7 @@ def remonter_au_tableau(page, table) -> None:
         position="top"
     )
 
-    time.sleep(1)
+    time.sleep(PAUSE_SCROLL)
 
 
 # ============================================================
@@ -769,42 +904,73 @@ def extraire_entetes(table) -> list[str]:
     return entetes
 
 
-def trouver_index(entetes: list[str], alias: list[str]):
-    alias_normalises = {normaliser(a) for a in alias}
+def trouver_index(entetes: list[str], libelle: str):
+    """Index de la colonne Jira dont le nom correspond au libellé."""
+    cible = normaliser(libelle)
 
     for index, nom in enumerate(entetes):
-        if normaliser(nom) in alias_normalises:
+        if normaliser(nom) == cible:
             return index
 
     return None
 
 
-def construire_colonnes(entetes: list[str]) -> dict:
-    idx_ref = trouver_index(entetes, ALIAS_REFERENCE)
+def libelles_absents(entetes: list[str], config: list[dict]) -> list[str]:
+    """Libellés de input.xlsx absents des en-têtes Jira."""
+    return [
+        c["libelle"]
+        for c in config
+        if trouver_index(entetes, c["libelle"]) is None
+    ]
 
-    if idx_ref is None:
+
+def construire_colonnes(entetes: list[str], config: list[dict]) -> dict:
+    """
+    Associe chaque colonne de input.xlsx à sa position dans le tableau Jira.
+
+    Retour :
+        {
+            "noms": [...],    # en-têtes Jira, dans l'ordre de l'écran
+            "nb": 13,         # nombre de cellules attendu par ligne
+            "ref": 1,         # index Jira de la colonne Référence
+            "export": [       # colonnes à exporter, dans l'ordre Excel
+                {"libelle", "index", "largeur", "format"}, ...
+            ]
+        }
+    """
+    absents = libelles_absents(entetes, config)
+
+    if absents:
         raise RuntimeError(
-            "Colonne Référence introuvable dans les en-têtes Jira : "
-            f"{entetes}"
+            f"Colonne(s) de input.xlsx absente(s) du tableau Jira : {absents}. "
+            f"En-têtes Jira lus : {entetes}"
         )
+
+    export = [
+        {
+            "libelle": c["libelle"],
+            "index": trouver_index(entetes, c["libelle"]),
+            "largeur": c["largeur"],
+            "format": c["format"],
+        }
+        for c in config
+    ]
+
+    idx_ref = next(
+        e["index"] for e in export if e["format"] == FORMAT_REFERENCE
+    )
 
     colonnes = {
         "noms": entetes,
         "nb": len(entetes),
-        "type": trouver_index(entetes, ALIAS_TYPE),
         "ref": idx_ref,
-        "iwm": trouver_index(entetes, ALIAS_URL_IWM),
-        "creation": trouver_index(entetes, ALIAS_CREATION),
-        "mise_a_jour": trouver_index(entetes, ALIAS_MISE_A_JOUR),
+        "export": export,
     }
 
     log(
-        f"{colonnes['nb']} colonne(s) détectée(s) : "
-        f"Type={colonnes['type']}, "
-        f"Référence={colonnes['ref']}, "
-        f"URL IWM={colonnes['iwm']}, "
-        f"Création={colonnes['creation']}, "
-        f"Mise à jour={colonnes['mise_a_jour']}"
+        f"{colonnes['nb']} colonne(s) dans Jira, "
+        f"{len(export)} exportée(s). "
+        f"Référence = colonne Jira n°{idx_ref + 1}."
     )
 
     return colonnes
@@ -814,108 +980,105 @@ def construire_colonnes(entetes: list[str]) -> dict:
 # EXTRACTION DES DONNEES
 # ============================================================
 
-def extraire_donnees_cellule(
-    page,
-    cellule,
-    index_colonne: int,
-    colonnes: dict
-) -> tuple[str, str]:
+# Lit toutes les lignes de la page en UN SEUL aller-retour avec Chrome
+# (au lieu d'un appel Playwright par cellule).
+JS_LIRE_PAGE = """
+(rowsSelector) => {
+    const table = document.querySelector("table.ext_ui_table");
 
-    if index_colonne == colonnes["type"]:
-        icone_type = cellule.locator(
-            "[data-testid='request-type-icon']"
-        )
+    if (!table) {
+        return [];
+    }
 
-        if icone_type.count() > 0:
-            texte = (
-                icone_type.get_attribute("title")
-                or icone_type.get_attribute("aria-label")
-                or cellule.inner_text()
-            )
-        else:
-            texte = cellule.inner_text()
+    return [...table.querySelectorAll(rowsSelector)].map(row =>
+        [...row.querySelectorAll("td")].map(td => {
+            const lien = td.querySelector("a");
+            const icone = td.querySelector(
+                "[data-testid='request-type-icon']"
+            );
 
-        return nettoyer_texte(texte), ""
+            return {
+                texte: td.innerText || "",
+                lien_texte: lien ? (lien.innerText || "") : "",
+                href: lien ? (lien.getAttribute("href") || "") : "",
+                icone: icone
+                    ? (icone.getAttribute("title")
+                       || icone.getAttribute("aria-label") || "")
+                    : ""
+            };
+        })
+    );
+}
+"""
 
-    if index_colonne == colonnes["ref"]:
-        lien = cellule.locator("a").first
 
-        if lien.count() > 0:
-            texte = nettoyer_texte(lien.inner_text())
-            href = lien.get_attribute("href") or ""
+def interpreter_cellule(page, cellule: dict, format_colonne: str):
+    """Renvoie (texte, url) selon le Format défini dans input.xlsx."""
+    texte = nettoyer_texte(cellule["texte"])
 
-            return texte, convertir_url_absolue(page, href)
+    if format_colonne == FORMAT_ICONE:
+        return nettoyer_texte(cellule["icone"]) or texte, ""
 
-        return nettoyer_texte(cellule.inner_text()), ""
-
-    if index_colonne == colonnes["iwm"]:
-        lien = cellule.locator("a").first
-
-        if lien.count() > 0:
-            texte = nettoyer_texte(lien.inner_text())
-            href = lien.get_attribute("href") or ""
+    if format_colonne in (FORMAT_REFERENCE, FORMAT_LIEN):
+        if cellule["lien_texte"] or cellule["href"]:
+            texte = nettoyer_texte(cellule["lien_texte"]) or texte
+            href = cellule["href"]
 
             if not href and texte.startswith(("https://", "http://")):
                 href = texte
 
             return texte, convertir_url_absolue(page, href)
 
-        texte = nettoyer_texte(cellule.inner_text())
-
         if texte.startswith(("https://", "http://")):
             return texte, texte
 
         return texte, ""
 
-    return nettoyer_texte(cellule.inner_text()), ""
+    return texte, ""
 
 
 def extraire_page_courante(page, table, colonnes: dict) -> list[dict]:
+    """
+    Extrait les lignes de la page courante.
+
+    Retour, une entrée par ligne :
+        {"values": {libellé: texte}, "liens": {libellé: url}}
+    """
     resultats = []
     nb_colonnes = colonnes["nb"]
 
-    rows = table.locator(ROWS_SELECTOR)
-    nb_rows = rows.count()
+    lignes = page.evaluate(JS_LIRE_PAGE, ROWS_SELECTOR)
 
-    log(f"{nb_rows} ligne(s) trouvée(s) sur cette page.")
+    log(f"{len(lignes)} ligne(s) trouvée(s) sur cette page.")
 
-    for index_ligne in range(nb_rows):
-        row = rows.nth(index_ligne)
-        cellules = row.locator("td")
-
-        if cellules.count() != nb_colonnes:
+    for index_ligne, cellules in enumerate(lignes):
+        if len(cellules) != nb_colonnes:
             log(
                 f"Ligne {index_ligne + 1} ignorée : "
-                f"{cellules.count()} cellule(s) au lieu de "
+                f"{len(cellules)} cellule(s) au lieu de "
                 f"{nb_colonnes}."
             )
             continue
 
-        valeurs = []
-        reference_url = ""
-        url_iwm_url = ""
+        valeurs = {}
+        liens = {}
 
-        for index_colonne in range(nb_colonnes):
-            texte, url = extraire_donnees_cellule(
+        for colonne in colonnes["export"]:
+            texte, url = interpreter_cellule(
                 page=page,
-                cellule=cellules.nth(index_colonne),
-                index_colonne=index_colonne,
-                colonnes=colonnes
+                cellule=cellules[colonne["index"]],
+                format_colonne=colonne["format"]
             )
 
-            valeurs.append(texte)
+            valeurs[colonne["libelle"]] = texte
 
-            if index_colonne == colonnes["ref"]:
-                reference_url = url
-
-            elif index_colonne == colonnes["iwm"]:
-                url_iwm_url = url
+            if url:
+                liens[colonne["libelle"]] = url
 
         resultats.append(
             {
                 "values": valeurs,
-                "reference_url": reference_url,
-                "url_iwm_url": url_iwm_url
+                "liens": liens
             }
         )
 
@@ -1056,7 +1219,8 @@ def aller_page_suivante(
             "(Référence inchangée après 30 s)."
         )
 
-    time.sleep(1)
+    # Pas de pause ici : attendre_tableau_charge a déjà confirmé
+    # que les lignes de la nouvelle page sont complètes.
 
 
 # ============================================================
@@ -1064,76 +1228,74 @@ def aller_page_suivante(
 # ============================================================
 
 def extraire_dataframe_complet(
-    page
-) -> tuple[pd.DataFrame, dict, dict, dict]:
+    page,
+    config: list[dict]
+) -> tuple[pd.DataFrame, dict, dict]:
 
     table = page.locator(TABLE_SELECTOR)
     table.wait_for(state="visible", timeout=60000)
 
     log("Tableau Jira détecté.")
 
-    # Configuration des colonnes AVANT tout scroll/pagination
-    configurer_colonnes_avant_scroll(page)
-
-    # Après sauvegarde, on relocalise le tableau.
-    table = page.locator(TABLE_SELECTOR)
-    table.wait_for(state="visible", timeout=60000)
-
     entetes = extraire_entetes(table)
 
     if not entetes:
-        entetes = ENTETES_PAR_DEFAUT
-        log("En-têtes non lus : application des noms par défaut.")
+        raise RuntimeError("Aucun en-tête lu dans le tableau Jira.")
 
-    colonnes = construire_colonnes(entetes)
+    # On n'ouvre "Modifier les colonnes" que pour les colonnes de
+    # input.xlsx qui ne sont pas déjà affichées dans Jira.
+    absents = libelles_absents(entetes, config)
+    colonnes_modifiees = False
 
-    # Page 1
-    log("===== Extraction de la première page =====")
+    if absents:
+        log(f"Colonne(s) à afficher dans Jira : {absents}")
 
-    toutes_les_lignes = extraire_page_courante(
-        page=page,
-        table=table,
-        colonnes=colonnes
-    )
+        configurer_colonnes_avant_scroll(page, absents)
+        colonnes_modifiees = True
 
-    log(
-        f"Première page extraite : "
-        f"{len(toutes_les_lignes)} ligne(s)."
-    )
+        # Après sauvegarde, on relocalise le tableau.
+        table = page.locator(TABLE_SELECTOR)
+        table.wait_for(state="visible", timeout=60000)
 
-    # Pagination après lecture de la première page.
-    nb_pages = get_nombre_total_pages_apres_premier_scrap(page)
+        entetes = extraire_entetes(table)
+    else:
+        log("Toutes les colonnes de input.xlsx sont déjà affichées dans Jira.")
 
-    # Pages 2 à N
-    for numero_page in range(2, nb_pages + 1):
-        page_actuelle = numero_page - 1
+    try:
+        colonnes = construire_colonnes(entetes, config)
+
+        # Page 1
+        log("===== Extraction de la première page =====")
+
+        toutes_les_lignes = extraire_page_courante(
+            page=page,
+            table=table,
+            colonnes=colonnes
+        )
 
         log(
-            f"===== Préparation extraction page "
-            f"{numero_page}/{nb_pages} ====="
+            f"Première page extraite : "
+            f"{len(toutes_les_lignes)} ligne(s)."
         )
 
-        aller_page_suivante(
-            page=page,
-            table=table,
-            page_actuelle=page_actuelle,
-            colonnes=colonnes
-        )
+        # Pagination après lecture de la première page.
+        nb_pages = get_nombre_total_pages_apres_premier_scrap(page)
 
-        remonter_au_tableau(
-            page=page,
-            table=table
-        )
+        # Pages 2 à N
+        for numero_page in range(2, nb_pages + 1):
+            page_actuelle = numero_page - 1
 
-        lignes_page = extraire_page_courante(
-            page=page,
-            table=table,
-            colonnes=colonnes
-        )
+            log(
+                f"===== Préparation extraction page "
+                f"{numero_page}/{nb_pages} ====="
+            )
 
-        if not lignes_page:
-            log("Aucune ligne lue : nouvel essai dans 3 secondes...")
-            time.sleep(3)
+            aller_page_suivante(
+                page=page,
+                table=table,
+                page_actuelle=page_actuelle,
+                colonnes=colonnes
+            )
 
             remonter_au_tableau(
                 page=page,
@@ -1146,46 +1308,73 @@ def extraire_dataframe_complet(
                 colonnes=colonnes
             )
 
-        toutes_les_lignes.extend(lignes_page)
+            if not lignes_page:
+                log("Aucune ligne lue : nouvel essai dans 3 secondes...")
+                time.sleep(3)
 
-        log(
-            f"Page {numero_page}/{nb_pages} extraite : "
-            f"{len(lignes_page)} ligne(s)."
-        )
+                remonter_au_tableau(
+                    page=page,
+                    table=table
+                )
 
-        if numero_page < nb_pages:
-            descendre_jusqu_a_pagination(page)
+                lignes_page = extraire_page_courante(
+                    page=page,
+                    table=table,
+                    colonnes=colonnes
+                )
 
-    # NOUVEAU : à la fin, restaurer les paramètres par défaut
-    restaurer_parametres_colonnes_par_defaut(page)
+            toutes_les_lignes.extend(lignes_page)
 
-    # Construction des données et liens.
+            log(
+                f"Page {numero_page}/{nb_pages} extraite : "
+                f"{len(lignes_page)} ligne(s)."
+            )
+
+            if numero_page < nb_pages:
+                descendre_jusqu_a_pagination(page)
+
+    finally:
+        # Remise des colonnes Jira par défaut, même en cas d'erreur,
+        # si le script les a modifiées.
+        if colonnes_modifiees:
+            try:
+                restaurer_parametres_colonnes_par_defaut(page)
+            except Exception as exc:
+                log(
+                    "Restauration des colonnes Jira impossible : "
+                    f"{type(exc).__name__} - {exc}"
+                )
+
+    # Construction du DataFrame, dans l'ordre de input.xlsx.
+    libelles = [c["libelle"] for c in colonnes["export"]]
+    libelles_lien = [
+        c["libelle"]
+        for c in colonnes["export"]
+        if c["format"] in (FORMAT_REFERENCE, FORMAT_LIEN)
+    ]
+
     data = []
-    liens_references = {}
-    liens_url_iwm = {}
 
     for ligne in toutes_les_lignes:
-        valeurs = ligne["values"]
+        enregistrement = dict(ligne["values"])
 
-        if len(valeurs) != colonnes["nb"]:
-            continue
+        for libelle in libelles_lien:
+            enregistrement[f"__lien__{libelle}"] = ligne["liens"].get(
+                libelle, ""
+            )
 
-        data.append(valeurs)
+        data.append(enregistrement)
 
-        reference = valeurs[colonnes["ref"]]
+    df = pd.DataFrame(
+        data,
+        columns=libelles + [f"__lien__{l}" for l in libelles_lien]
+    )
 
-        if reference and ligne["reference_url"]:
-            liens_references[reference] = ligne["reference_url"]
-
-        if colonnes["iwm"] is not None:
-            valeur_url_iwm = valeurs[colonnes["iwm"]]
-
-            if valeur_url_iwm and ligne["url_iwm_url"]:
-                liens_url_iwm[valeur_url_iwm] = ligne["url_iwm_url"]
-
-    df = pd.DataFrame(data, columns=colonnes["noms"])
-
-    nom_reference = colonnes["noms"][colonnes["ref"]]
+    nom_reference = next(
+        c["libelle"]
+        for c in colonnes["export"]
+        if c["format"] == FORMAT_REFERENCE
+    )
 
     if not df.empty:
         nb_avant = len(df)
@@ -1203,27 +1392,24 @@ def extraire_dataframe_complet(
                 f"sur la colonne {nom_reference}."
             )
 
+    # Les URLs sortent du DataFrame : une liste par colonne,
+    # alignée ligne à ligne avec df.
+    liens = {
+        libelle: df.pop(f"__lien__{libelle}").fillna("").tolist()
+        for libelle in libelles_lien
+    }
+
     date_reference = datetime.now()
 
-    if colonnes["creation"] is not None:
-        nom_creation = colonnes["noms"][colonnes["creation"]]
+    for colonne in colonnes["export"]:
+        if colonne["format"] == FORMAT_DATE:
+            convertir_colonne_date(
+                df=df,
+                nom_colonne=colonne["libelle"],
+                date_reference=date_reference
+            )
 
-        convertir_colonne_date(
-            df=df,
-            nom_colonne=nom_creation,
-            date_reference=date_reference
-        )
-
-    if colonnes["mise_a_jour"] is not None:
-        nom_mise_a_jour = colonnes["noms"][colonnes["mise_a_jour"]]
-
-        convertir_colonne_date(
-            df=df,
-            nom_colonne=nom_mise_a_jour,
-            date_reference=date_reference
-        )
-
-    return df, liens_references, liens_url_iwm, colonnes
+    return df, liens, colonnes
 
 
 # ============================================================
@@ -1232,97 +1418,49 @@ def extraire_dataframe_complet(
 
 def appliquer_hyperliens(
     ws,
-    nom_colonne: str,
-    liens: dict,
-    accepter_url_brute: bool = False
+    numero_colonne: int,
+    urls: list[str]
 ) -> None:
-
-    index_colonne = None
-
-    for cellule in ws[1]:
-        if nettoyer_texte(cellule.value) == nom_colonne:
-            index_colonne = cellule.column
-            break
-
-    if index_colonne is None:
-        log(f"Colonne « {nom_colonne} » introuvable dans Excel.")
-        return
-
+    """Pose un hyperlien sur chaque cellule de la colonne (ligne à ligne)."""
     compteur = 0
 
-    for numero_ligne in range(2, ws.max_row + 1):
+    for decalage, url in enumerate(urls):
+        if not url:
+            continue
+
         cellule = ws.cell(
-            row=numero_ligne,
-            column=index_colonne
+            row=decalage + 2,
+            column=numero_colonne
         )
 
-        valeur = nettoyer_texte(cellule.value)
-        url = liens.get(valeur, "")
-
-        if (
-            not url
-            and accepter_url_brute
-            and valeur.startswith(("https://", "http://"))
-        ):
-            url = valeur
-
-        if url:
-            cellule.hyperlink = url
-            cellule.font = Font(
-                color="0563C1",
-                underline="single"
-            )
-            compteur += 1
+        cellule.hyperlink = url
+        cellule.font = Font(
+            color="0563C1",
+            underline="single"
+        )
+        compteur += 1
 
     log(
         f"{compteur} lien(s) créé(s) dans la colonne "
-        f"« {nom_colonne} »."
+        f"« {ws.cell(row=1, column=numero_colonne).value} »."
     )
-
-
-def ajuster_largeurs_colonnes(ws) -> None:
-    largeurs = {
-        normaliser(nom): largeur
-        for nom, largeur in LARGEURS_COLONNES.items()
-    }
-
-    for cellule in ws[1]:
-        lettre = get_column_letter(cellule.column)
-
-        largeur = largeurs.get(
-            normaliser(cellule.value),
-            LARGEUR_PAR_DEFAUT
-        )
-
-        ws.column_dimensions[lettre].width = largeur
 
 
 def formater_colonne_date_excel(
     ws,
-    nom_colonne: str
+    numero_colonne: int
 ) -> None:
     """Applique le format dd/mm/yyyy hh:mm à une colonne Excel."""
-    index_colonne = None
-
-    for cellule in ws[1]:
-        if nettoyer_texte(cellule.value) == nom_colonne:
-            index_colonne = cellule.column
-            break
-
-    if index_colonne is None:
-        return
-
     for numero_ligne in range(2, ws.max_row + 1):
         ws.cell(
             row=numero_ligne,
-            column=index_colonne
+            column=numero_colonne
         ).number_format = "dd/mm/yyyy hh:mm"
 
 
 def exporter_vers_excel(
     df: pd.DataFrame,
-    liens_references: dict,
-    liens_url_iwm: dict,
+    liens: dict,
     colonnes: dict,
     chemin_fichier: str
 ) -> None:
@@ -1366,33 +1504,24 @@ def exporter_vers_excel(
                 wrap_text=True
             )
 
-    appliquer_hyperliens(
-        ws=ws,
-        nom_colonne=colonnes["noms"][colonnes["ref"]],
-        liens=liens_references
-    )
+    # Liens, dates et largeurs : tout vient de input.xlsx.
+    for numero_colonne, colonne in enumerate(colonnes["export"], start=1):
+        if colonne["libelle"] in liens:
+            appliquer_hyperliens(
+                ws=ws,
+                numero_colonne=numero_colonne,
+                urls=liens[colonne["libelle"]]
+            )
 
-    if colonnes["iwm"] is not None:
-        appliquer_hyperliens(
-            ws=ws,
-            nom_colonne=colonnes["noms"][colonnes["iwm"]],
-            liens=liens_url_iwm,
-            accepter_url_brute=True
-        )
+        if colonne["format"] == FORMAT_DATE:
+            formater_colonne_date_excel(
+                ws=ws,
+                numero_colonne=numero_colonne
+            )
 
-    if colonnes["creation"] is not None:
-        formater_colonne_date_excel(
-            ws=ws,
-            nom_colonne=colonnes["noms"][colonnes["creation"]]
-        )
-
-    if colonnes["mise_a_jour"] is not None:
-        formater_colonne_date_excel(
-            ws=ws,
-            nom_colonne=colonnes["noms"][colonnes["mise_a_jour"]]
-        )
-
-    ajuster_largeurs_colonnes(ws)
+        ws.column_dimensions[
+            get_column_letter(numero_colonne)
+        ].width = colonne["largeur"]
 
     for numero_ligne in range(2, ws.max_row + 1):
         ws.row_dimensions[numero_ligne].height = 35
@@ -1405,6 +1534,14 @@ def exporter_vers_excel(
 # ============================================================
 
 def run(playwright) -> bool:
+    # Lecture de input.xlsx AVANT d'ouvrir Chrome : une erreur de
+    # paramétrage s'affiche tout de suite, sans passer par le SSO.
+    try:
+        config = charger_config_colonnes()
+    except Exception as exc:
+        log(f"ERREUR : {exc}")
+        return False
+
     browser = playwright.chromium.launch(
         executable_path=CHROME_PATH,
         headless=HEADLESS
@@ -1465,9 +1602,7 @@ def run(playwright) -> bool:
 
         log("Début de l'extraction Jira...")
 
-        df, liens_references, liens_url_iwm, colonnes = (
-            extraire_dataframe_complet(page)
-        )
+        df, liens, colonnes = extraire_dataframe_complet(page, config)
 
         if df.empty:
             log("Aucune donnée extraite.")
@@ -1479,8 +1614,7 @@ def run(playwright) -> bool:
 
         exporter_vers_excel(
             df=df,
-            liens_references=liens_references,
-            liens_url_iwm=liens_url_iwm,
+            liens=liens,
             colonnes=colonnes,
             chemin_fichier=FICHIER_EXCEL
         )
