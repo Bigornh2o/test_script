@@ -4,6 +4,8 @@ import os
 import json
 import base64
 import tempfile
+import queue
+import threading
 from datetime import datetime
 from pathlib import Path
 import pandas as pd
@@ -1286,9 +1288,24 @@ def cliquer_un_accept(page, restants, output_dir):
     return None
 
 
+def _signaler(progression, *evenement):
+    """Transmet l'avancement à l'interface (optionnel, sans jamais bloquer le robot)."""
+    if progression is None:
+        return
+    try:
+        progression(*evenement)
+    except Exception:
+        pass
+
+
+def _arret_demande(arret):
+    return arret is not None and arret.is_set()
+
+
 def attendre_et_telecharger_fichiers(page, expected_rows, output_dir,
                                      interval_seconds=INTERVALLE_NOTIFS_SEC,
-                                     timeout_minutes=TIMEOUT_NOTIFS_MIN):
+                                     timeout_minutes=TIMEOUT_NOTIFS_MIN,
+                                     progression=None, arret=None):
     fichiers = []
     restants = list(expected_rows)
     nb_attendus = len(expected_rows)
@@ -1299,11 +1316,16 @@ def attendre_et_telecharger_fichiers(page, expected_rows, output_dir,
 
     os.makedirs(output_dir, exist_ok=True)
     log(f"Attente de {nb_attendus} fichier(s) dans les notifications...")
+    _signaler(progression, "telechargement", 0, nb_attendus)
 
     deadline = time.time() + timeout_minutes * 60
     termine = False
 
     while restants and not termine and time.time() < deadline:
+        if _arret_demande(arret):
+            log("Arrêt demandé : attente des fichiers interrompue.")
+            break
+
         try:
             ouvrir_panneau_notifications(page)
 
@@ -1317,6 +1339,7 @@ def attendre_et_telecharger_fichiers(page, expected_rows, output_dir,
                     restants.remove(info["_row"])
                 fichiers.append(info)
                 log(f"Fichier {len(fichiers)} ({info['Verification']}) : {info['Fichier']}")
+                _signaler(progression, "telechargement", min(len(fichiers), nb_attendus), nb_attendus)
 
         except Exception as e:
             log(f"ATTENTION : erreur pendant la vérification des notifications : {e}")
@@ -1326,6 +1349,7 @@ def attendre_et_telecharger_fichiers(page, expected_rows, output_dir,
 
         nb_ok = nb_attendus - len(restants)
         log(f"{nb_ok}/{nb_attendus} fichier(s) vérifié(s), nouvelle vérification dans {interval_seconds}s...")
+        _signaler(progression, "attente", min(len(fichiers), nb_attendus), nb_attendus)
         fermer_panneau_notifications(page)
         page.wait_for_timeout(interval_seconds * 1000)
 
@@ -1341,7 +1365,7 @@ def attendre_et_telecharger_fichiers(page, expected_rows, output_dir,
 # ============================================================
 # Traitement principal
 # ============================================================
-def run(playwright, df, output_dir):
+def run(playwright, df, output_dir, progression=None, arret=None):
     browser = playwright.chromium.launch(
         executable_path=CHROME_PATH,
         headless=False
@@ -1359,13 +1383,19 @@ def run(playwright, df, output_dir):
     nb_generes = 0
 
     try:
+        _signaler(progression, "connexion")
         connexion(page)
 
         rows_to_process = lire_lignes_depuis_df(df)
         log(f"{len(rows_to_process)} valeur(s) N_intv à traiter")
 
         for idx, ligne in enumerate(rows_to_process, start=1):
+            if _arret_demande(arret):
+                log(f"Arrêt demandé : {len(rows_to_process) - idx + 1} N_intv non traité(s).")
+                break
+
             n_intv = ligne["N_intv"]
+            _signaler(progression, "soumission", idx, len(rows_to_process), n_intv)
             date_ligne = ligne["Date"]
             statement_type = ligne["StatementType"]
             performance_type = ligne["PerformanceType"]
@@ -1397,6 +1427,7 @@ def run(playwright, df, output_dir):
                 })
             except Exception as e:
                 log(f"ERREUR sur {n_intv} : {e}")
+                _signaler(progression, "echec", idx, len(rows_to_process), n_intv)
                 resultats.append({
                     "N_intv": n_intv,
                     "Date": date_ligne,
@@ -1416,7 +1447,12 @@ def run(playwright, df, output_dir):
                     log(f"ATTENTION : impossible de cliquer Clear all filters : {e}")
 
         log(f"{nb_generes}/{len(rows_to_process)} génération(s) soumise(s) avec succès.")
-        fichiers = attendre_et_telecharger_fichiers(page, rows_generees, output_dir)
+        if _arret_demande(arret):
+            log("Arrêt demandé : les fichiers déjà soumis ne seront pas téléchargés.")
+        else:
+            fichiers = attendre_et_telecharger_fichiers(
+                page, rows_generees, output_dir, progression=progression, arret=arret
+            )
         log("Traitement terminé.")
 
     finally:
@@ -1914,6 +1950,7 @@ def ouvrir_interface():
 
     dernier_etat_reference = {"value": None}
     preset_precedent = {"value": ""}
+    suivi = {"en_cours": False, "arret": None, "echecs": 0, "fermer_apres": False}
 
     def get_liste_n_intv():
         contenu = txt_n_intv.get("1.0", "end")
@@ -2223,24 +2260,88 @@ def ouvrir_interface():
         btn_delete_preset.configure(state="disabled")
         btn_reset.configure(state="disabled")
         cb_preset.configure(state="disabled")
+        btn_identifiants.configure(state="disabled")
 
     def reactiver_boutons_apres_traitement():
         btn_valider.configure(state="normal")
         btn_generate.configure(state="normal" if data_validee else "disabled")
         btn_last_params.configure(state="normal")
         btn_save_preset.configure(state="normal")
+        btn_reset.configure(state="normal")
         cb_preset.configure(state="normal")
+        btn_identifiants.configure(state="normal")
         update_delete_button()
 
+    def _barre_indeterminee(active):
+        if active and progress_bar.cget("mode") != "indeterminate":
+            progress_bar.configure(mode="indeterminate")
+            progress_bar.start()
+        elif not active and progress_bar.cget("mode") != "determinate":
+            progress_bar.stop()
+            progress_bar.configure(mode="determinate")
+
     def afficher_traitement():
-        lbl_processing.configure(text="Traitement en cours...")
-        progress_bar.pack(side="left", padx=(0, 10))
-        progress_bar.start()
+        lbl_status.configure(text="")
+        lbl_echecs.configure(text="")
+        lbl_compteur.configure(text="")
+        lbl_processing.configure(text="Lancement du navigateur…")
+        _barre_indeterminee(True)
+        suivi_frame.pack(side="left")
+        btn_arreter.configure(state="normal", text="Arrêter")
+        btn_arreter.pack(side="left", padx=(0, 12), before=btn_valider)
 
     def masquer_traitement():
-        progress_bar.stop()
-        progress_bar.pack_forget()
+        _barre_indeterminee(False)
+        progress_bar.set(0)
+        suivi_frame.pack_forget()
+        btn_arreter.pack_forget()
         lbl_processing.configure(text="")
+
+    def afficher_progression(evenement, *infos):
+        """Met à jour le suivi à partir des événements envoyés par run()."""
+        if evenement == "connexion":
+            lbl_processing.configure(text="Connexion à Cockpit…")
+            _barre_indeterminee(True)
+
+        elif evenement == "soumission":
+            idx, total, n_intv = infos
+            _barre_indeterminee(False)
+            lbl_processing.configure(text=f"Génération · N° {n_intv}")
+            lbl_compteur.configure(text=f"{idx}/{total}")
+            progress_bar.set((idx - 1) / total)
+
+        elif evenement == "echec":
+            suivi["echecs"] += 1
+            lbl_echecs.configure(text=_accorder(suivi["echecs"], "", "✗ 1 échec", "✗ {n} échecs"))
+
+        elif evenement in ("telechargement", "attente"):
+            faits, total = infos
+            _barre_indeterminee(False)
+            if evenement == "attente":
+                lbl_processing.configure(text="Téléchargement · en attente de Cockpit…")
+            else:
+                lbl_processing.configure(text="Téléchargement des reportings")
+            lbl_compteur.configure(text=f"{faits}/{total}")
+            progress_bar.set(faits / total if total else 1)
+
+    def arreter_traitement():
+        if suivi["arret"] is None:
+            return
+        suivi["arret"].set()
+        btn_arreter.configure(state="disabled", text="Arrêt…")
+        lbl_processing.configure(text="Arrêt en cours, fin de l'étape en cours…")
+        log("Arrêt demandé par l'utilisateur.")
+
+    def fermeture_pendant_traitement():
+        if not suivi["en_cours"]:
+            root.destroy()
+            return
+        if messagebox.askyesno(
+            "Traitement en cours",
+            "Une génération est en cours.\nL'arrêter et fermer le robot ?"
+        ):
+            suivi["fermer_apres"] = True
+            arreter_traitement()
 
     def coller_presse_papier():
         try:
@@ -2443,45 +2544,93 @@ def ouvrir_interface():
 
         desactiver_boutons_traitement()
         afficher_traitement()
-        root.update_idletasks()
-        root.update()
 
-        try:
-            with sync_playwright() as playwright:
-                nb = run(playwright, df_courant, chemin_output)
+        # Le robot Playwright tourne dans un fil séparé : l'interface reste
+        # réactive et reçoit l'avancement via une file de messages.
+        messages = queue.Queue()
+        arret = threading.Event()
+        suivi.update(en_cours=True, arret=arret, echecs=0, fermer_apres=False)
+        df_a_traiter = df_courant
 
-            masquer_traitement()
+        def travail_robot():
+            try:
+                with sync_playwright() as playwright:
+                    nb = run(
+                        playwright, df_a_traiter, chemin_output,
+                        progression=lambda *evenement: messages.put(("progression", evenement)),
+                        arret=arret,
+                    )
+                messages.put(("fin", nb))
+            except EchecConnexionCockpit:
+                messages.put(("echec_connexion", None))
+            except Exception as e:
+                messages.put(("erreur", e))
 
-            fermer_robot = popup_fin_generation_choix(root, nb)
-
-            if fermer_robot:
-                root.destroy()
-            else:
-                reactiver_boutons_apres_traitement()
-                lbl_status.configure(
-                    text=_accorder(
-                        nb,
-                        "✓ Dernière génération terminée (aucun reporting)",
-                        "✓ Dernière génération terminée (1 reporting)",
-                        "✓ Dernière génération terminée ({n} reportings)",
-                    ),
-                    text_color=GREEN
-                )
-
-        except EchecConnexionCockpit:
+        def fin_traitement():
+            suivi.update(en_cours=False, arret=None)
             masquer_traitement()
             reactiver_boutons_apres_traitement()
-            log("Connexion refusée par Cockpit : demande de nouveaux identifiants.")
-            if demander_identifiants_ui(
-                message="Cockpit a refusé tes identifiants (mot de passe expiré ?). "
-                        "Mets-les à jour : la génération sera relancée automatiquement."
-            ):
-                generer()
 
-        except Exception as e:
-            masquer_traitement()
-            reactiver_boutons_apres_traitement()
-            messagebox.showerror("Erreur", f"Erreur pendant le traitement : {e}")
+        def lire_messages():
+            try:
+                while True:
+                    type_message, contenu = messages.get_nowait()
+
+                    if type_message == "progression":
+                        afficher_progression(*contenu)
+                        continue
+
+                    arret_demande = arret.is_set()
+                    fin_traitement()
+
+                    if suivi["fermer_apres"]:
+                        root.destroy()
+                        return
+
+                    if type_message == "fin":
+                        nb = contenu
+                        if arret_demande:
+                            lbl_status.configure(
+                                text=_accorder(
+                                    nb,
+                                    "⏹ Traitement arrêté (aucun reporting soumis)",
+                                    "⏹ Traitement arrêté (1 reporting soumis)",
+                                    "⏹ Traitement arrêté ({n} reportings soumis)",
+                                ),
+                                text_color=UI_MUTED
+                            )
+                        elif popup_fin_generation_choix(root, nb):
+                            root.destroy()
+                        else:
+                            lbl_status.configure(
+                                text=_accorder(
+                                    nb,
+                                    "✓ Dernière génération terminée (aucun reporting)",
+                                    "✓ Dernière génération terminée (1 reporting)",
+                                    "✓ Dernière génération terminée ({n} reportings)",
+                                ),
+                                text_color=GREEN
+                            )
+
+                    elif type_message == "echec_connexion":
+                        log("Connexion refusée par Cockpit : demande de nouveaux identifiants.")
+                        if demander_identifiants_ui(
+                            message="Cockpit a refusé tes identifiants (mot de passe expiré ?). "
+                                    "Mets-les à jour : la génération sera relancée automatiquement."
+                        ):
+                            generer()
+
+                    elif type_message == "erreur":
+                        messagebox.showerror("Erreur", f"Erreur pendant le traitement : {contenu}")
+
+                    return
+            except queue.Empty:
+                pass
+
+            root.after(150, lire_messages)
+
+        threading.Thread(target=travail_robot, name="robot_cockpit", daemon=True).start()
+        root.after(150, lire_messages)
 
     for v in [var_perf, var_currency, var_lang, var_monthly, var_annual]:
         v.trace_add("write", mark_dirty)
@@ -2523,7 +2672,7 @@ def ouvrir_interface():
         height=28,
     ).grid(row=0, column=1, sticky="e", padx=(28, 10), ipadx=10)
 
-    ctk.CTkButton(
+    btn_identifiants = ctk.CTkButton(
         header,
         text="Modifier les identifiants",
         command=lambda: demander_identifiants_ui(),
@@ -2534,7 +2683,8 @@ def ouvrir_interface():
         corner_radius=14,
         height=28,
         cursor="hand2",
-    ).grid(row=0, column=2, sticky="e", padx=(0, 28))
+    )
+    btn_identifiants.grid(row=0, column=2, sticky="e", padx=(0, 28))
 
     # ---- Barre des paramétrages ------------------------------
     preset_row = ctk.CTkFrame(root, fg_color=UI_CARD, corner_radius=12, border_width=1, border_color=UI_BORDER)
@@ -2770,25 +2920,44 @@ def ouvrir_interface():
     lbl_status = ctk.CTkLabel(status_frame, text="", text_color=GREEN, font=_police(13, "bold"))
     lbl_status.pack(side="left", padx=(0, 20))
 
+    # Suivi du traitement (affiché uniquement pendant une génération)
+    suivi_frame = ctk.CTkFrame(status_frame, fg_color="transparent")
+
+    lbl_processing = ctk.CTkLabel(
+        suivi_frame,
+        text="",
+        text_color=UI_TEXT,
+        font=_police(13),
+        anchor="w",
+        width=330,
+    )
+    lbl_processing.pack(side="left", padx=(0, 12))
+
     progress_bar = ctk.CTkProgressBar(
-        status_frame,
-        mode="indeterminate",
-        width=180,
-        height=6,
+        suivi_frame,
+        mode="determinate",
+        width=220,
+        height=8,
+        corner_radius=4,
         progress_color=UI_PRIMARY,
         fg_color=UI_FIELD_HOVER,
     )
+    progress_bar.set(0)
+    progress_bar.pack(side="left", padx=(0, 12))
 
-    lbl_processing = ctk.CTkLabel(
-        status_frame,
-        text="",
-        text_color=UI_MUTED,
-        font=ctk.CTkFont(family=UI_FONT, size=13, slant="italic")
-    )
-    lbl_processing.pack(side="left")
+    lbl_compteur = ctk.CTkLabel(suivi_frame, text="", text_color=UI_TEXT, font=_police(13, "bold"))
+    lbl_compteur.pack(side="left", padx=(0, 12))
+
+    lbl_echecs = ctk.CTkLabel(suivi_frame, text="", text_color=RED, font=_police(12, "bold"))
+    lbl_echecs.pack(side="left")
 
     actions = ctk.CTkFrame(bottom, fg_color="transparent")
     actions.grid(row=1, column=1, sticky="e", padx=28)
+
+    btn_arreter = _Bouton(
+        actions, "danger", text="Arrêter", command=arreter_traitement,
+        width=110, height=42, font=_police(14, "bold")
+    )
 
     btn_valider = _Bouton(
         actions, "secondaire", text="VALIDER", command=valider,
@@ -2807,6 +2976,7 @@ def ouvrir_interface():
     rafraichir_info_output()
     refresh_preset_combo(select="")
     set_reference_state()
+    root.protocol("WM_DELETE_WINDOW", fermeture_pendant_traitement)
     root.after(300, verifier_identifiants_au_demarrage)
     root.mainloop()
 
