@@ -1484,6 +1484,17 @@ class _Bouton(ctk.CTkButton):
         super().configure(require_redraw=require_redraw, **kwargs)
 
 
+def _accorder(n, aucun, singulier, pluriel):
+    """Choisit le texte selon n (0, 1 ou plusieurs). {n} est remplacé par le nombre."""
+    if n == 0:
+        texte = aucun
+    elif n == 1:
+        texte = singulier
+    else:
+        texte = pluriel
+    return texte.format(n=n)
+
+
 def _police(size=13, weight="normal"):
     return ctk.CTkFont(family=UI_FONT, size=size, weight=weight)
 
@@ -1552,7 +1563,12 @@ def popup_fin_generation_choix(parent, nb_generes):
 
     ctk.CTkLabel(
         frame,
-        text=f"Les {nb_generes} reporting(s) ont été générés.",
+        text=_accorder(
+            nb_generes,
+            "Aucun reporting n'a été généré.",
+            "Le reporting a été généré.",
+            "Les {n} reportings ont été générés.",
+        ),
         font=_police(13),
         text_color=UI_MUTED,
         anchor="w"
@@ -1759,8 +1775,10 @@ def modale_identifiants(root, username_initial="", message=None, obligatoire=Fal
         champ.bind("<Key>", lambda event: lbl_erreur.configure(text="") if event.keysym != "Return" else None)
 
     # ---- Blocage du reste de la fenêtre pendant la saisie ------
-    redimensionnable = root.resizable()
-    root.resizable(False, False)
+    # tk.Tk.resizable et non root.resizable : la version CustomTkinter masque
+    # brièvement la fenêtre sous Windows (clignotement)
+    redimensionnable = tk.Tk.resizable(root)
+    tk.Tk.resizable(root, False, False)
     ancien_protocole = root.protocol("WM_DELETE_WINDOW")
 
     def fermeture_fenetre():
@@ -1784,7 +1802,7 @@ def modale_identifiants(root, username_initial="", message=None, obligatoire=Fal
         pass
     carte.destroy()
     calque.destroy()
-    root.resizable(*redimensionnable)
+    tk.Tk.resizable(root, *redimensionnable)
     root.protocol("WM_DELETE_WINDOW", ancien_protocole or root.destroy)
 
     if resultat["quitter"]:
@@ -1868,7 +1886,7 @@ def ouvrir_interface():
     lbl_processing = None
     progress_bar = None
     txt_n_intv = None
-    info_var = tk.StringVar(value="0 Numéro(s) d'intervenant détecté(s)")
+    info_var = tk.StringVar(value="Aucun numéro d'intervenant détecté")
     lbl_intro = None
     lbl_output_state = None
     seg_statement = None
@@ -1902,11 +1920,19 @@ def ouvrir_interface():
 
     def mettre_a_jour_compteur(*_):
         liste = get_liste_n_intv()
-        info_var.set(f"{len(liste)} Numéro(s) d'intervenant détecté(s)")
+        info_var.set(_accorder(
+            len(liste),
+            "Aucun numéro d'intervenant détecté",
+            "1 numéro d'intervenant détecté",
+            "{n} numéros d'intervenant détectés",
+        ))
         if lbl_intro is not None:
-            lbl_intro.configure(
-                text=f"{len(liste)} Numéro(s) d'intervenant seront traités. Les paramètres ci-dessous seront appliqués à tous."
-            )
+            lbl_intro.configure(text=_accorder(
+                len(liste),
+                "Aucun numéro d'intervenant à traiter pour l'instant.",
+                "1 numéro d'intervenant sera traité. Les paramètres ci-dessous lui seront appliqués.",
+                "{n} numéros d'intervenant seront traités. Les paramètres ci-dessous seront appliqués à tous.",
+            ))
 
     def normalize_preset_payload(payload):
         n_intv = payload.get("n_intv", [])
@@ -2152,7 +2178,12 @@ def ouvrir_interface():
 
         if afficher_message_succes:
             lbl_status.configure(
-                text=f"✓ Data validée ({len(df_courant)} numéro(s) d'intervenant) | UT : {ut_code}",
+                text=_accorder(
+                    len(df_courant),
+                    "✓ Data validée (aucun numéro d'intervenant)",
+                    "✓ Data validée (1 numéro d'intervenant)",
+                    "✓ Data validée ({n} numéros d'intervenant)",
+                ) + f" | UT : {ut_code}",
                 text_color=GREEN
             )
 
@@ -2407,7 +2438,12 @@ def ouvrir_interface():
             else:
                 reactiver_boutons_apres_traitement()
                 lbl_status.configure(
-                    text=f"✓ Dernière génération terminée ({nb} reporting(s))",
+                    text=_accorder(
+                        nb,
+                        "✓ Dernière génération terminée (aucun reporting)",
+                        "✓ Dernière génération terminée (1 reporting)",
+                        "✓ Dernière génération terminée ({n} reportings)",
+                    ),
                     text_color=GREEN
                 )
 
@@ -2533,7 +2569,7 @@ def ouvrir_interface():
 
     lbl_intro = ctk.CTkLabel(
         zone_corps,
-        text="0 Numéro(s) d'intervenant seront traités. Les paramètres ci-dessous seront appliqués à tous.",
+        text="Aucun numéro d'intervenant à traiter pour l'instant.",
         font=_police(12),
         text_color=UI_MUTED,
         anchor="w",
