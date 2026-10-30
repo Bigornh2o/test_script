@@ -1649,6 +1649,7 @@ def modale_identifiants(root, username_initial="", message=None, obligatoire=Fal
         echelle = 1.0
 
     image_fond = None
+    capture_fond = None
     couleur_coins = UI_BG
     try:
         from PIL import Image, ImageFilter, ImageGrab
@@ -1662,6 +1663,7 @@ def modale_identifiants(root, username_initial="", message=None, obligatoire=Fal
         r, g, b = capture.crop((cx - 260, cy - 200, cx + 260, cy + 200)).resize((1, 1)).getpixel((0, 0))
         couleur_coins = f"#{r:02x}{g:02x}{b:02x}"
 
+        capture_fond = capture
         image_fond = ctk.CTkImage(light_image=capture, size=(largeur / echelle, hauteur / echelle))
     except Exception as e:
         log(f"Flou d'arrière-plan indisponible ({e}), fond uni utilisé.")
@@ -1775,10 +1777,21 @@ def modale_identifiants(root, username_initial="", message=None, obligatoire=Fal
         champ.bind("<Key>", lambda event: lbl_erreur.configure(text="") if event.keysym != "Return" else None)
 
     # ---- Blocage du reste de la fenêtre pendant la saisie ------
-    # tk.Tk.resizable et non root.resizable : la version CustomTkinter masque
-    # brièvement la fenêtre sous Windows (clignotement)
-    redimensionnable = tk.Tk.resizable(root)
-    tk.Tk.resizable(root, False, False)
+    # Pas de resizable(False, False) ici : sous Windows, changer cet attribut
+    # recrée le cadre de la fenêtre et la fait clignoter. Si la fenêtre est
+    # redimensionnée, le fond flouté est simplement réétiré à la nouvelle taille.
+    def ajuster_fond(event):
+        if event.widget is not root or capture_fond is None:
+            return
+        try:
+            calque.configure(image=ctk.CTkImage(
+                light_image=capture_fond,
+                size=(max(event.width, 1) / echelle, max(event.height, 1) / echelle)
+            ))
+        except Exception:
+            pass
+
+    id_ajuster_fond = root.bind("<Configure>", ajuster_fond, add="+")
     ancien_protocole = root.protocol("WM_DELETE_WINDOW")
 
     def fermeture_fenetre():
@@ -1802,7 +1815,10 @@ def modale_identifiants(root, username_initial="", message=None, obligatoire=Fal
         pass
     carte.destroy()
     calque.destroy()
-    tk.Tk.resizable(root, *redimensionnable)
+    try:
+        root.unbind("<Configure>", id_ajuster_fond)
+    except Exception:
+        pass
     root.protocol("WM_DELETE_WINDOW", ancien_protocole or root.destroy)
 
     if resultat["quitter"]:
@@ -1822,6 +1838,11 @@ def ouvrir_interface():
 
     data_validee = False
     df_courant = pd.DataFrame(columns=GUI_COLUMNS)
+
+    # Thème clair uniquement : on désactive la recoloration de la barre de titre
+    # Windows, qui masque/réaffiche la fenêtre (clignotement) sans rien apporter ici.
+    ctk.CTk._deactivate_windows_window_header_manipulation = True
+    ctk.CTkToplevel._deactivate_windows_window_header_manipulation = True
 
     ctk.set_appearance_mode("light")
     ctk.set_default_color_theme("blue")
