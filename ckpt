@@ -10,6 +10,7 @@ import sys
 import tkinter as tk
 from tkinter import messagebox, ttk, filedialog, simpledialog
 from tkcalendar import DateEntry
+import customtkinter as ctk
 from playwright.sync_api import sync_playwright
 
 # En .exe sans console (--noconsole), sys.stdout vaut None
@@ -1323,36 +1324,139 @@ def run(playwright, df, output_dir):
 
 
 # ============================================================
+# Thème de l'interface (CustomTkinter)
+# ============================================================
+UI_BG = "#F4F6FA"            # fond de l'application
+UI_CARD = "#FFFFFF"          # fond des cartes
+UI_BORDER = "#E3E8EF"        # bordures discrètes
+UI_FIELD = "#F1F4F9"         # fond des champs
+UI_FIELD_HOVER = "#E4EAF3"
+UI_PRIMARY = BLUE
+UI_PRIMARY_HOVER = "#082E6E"
+UI_PRIMARY_DISABLED = "#A9B8D3"
+UI_TEXT = "#111827"
+UI_MUTED = "#6B7280"
+UI_HOVER_LIGHT = "#EEF2F8"
+UI_GREEN_BG = "#E7F4EC"
+UI_DANGER_BORDER = "#F1C4BF"
+UI_DANGER_HOVER = "#FDECEA"
+UI_FONT = "Segoe UI"
+
+_STYLES_BOUTON = {
+    "primaire": dict(
+        fg_color=UI_PRIMARY, hover_color=UI_PRIMARY_HOVER, text_color=WHITE,
+        text_color_disabled=WHITE, border_width=0, _fg_disabled=UI_PRIMARY_DISABLED,
+    ),
+    "secondaire": dict(
+        fg_color=UI_CARD, hover_color=UI_HOVER_LIGHT, text_color=UI_TEXT,
+        text_color_disabled="#A0A7B4", border_width=1, border_color=UI_BORDER,
+    ),
+    "danger": dict(
+        fg_color=UI_CARD, hover_color=UI_DANGER_HOVER, text_color=RED,
+        text_color_disabled="#D9A9A3", border_width=1, border_color=UI_DANGER_BORDER,
+    ),
+    "fantome": dict(
+        fg_color="transparent", hover_color=UI_HOVER_LIGHT, text_color=UI_MUTED,
+        text_color_disabled="#B8BEC8", border_width=0,
+    ),
+}
+
+
+class _Bouton(ctk.CTkButton):
+    """CTkButton avec variantes de style et couleur grisée quand il est désactivé."""
+
+    def __init__(self, master, variante="secondaire", **kwargs):
+        styles = dict(_STYLES_BOUTON[variante])
+        self._fg_actif = styles["fg_color"]
+        self._fg_inactif = styles.pop("_fg_disabled", styles["fg_color"])
+        options = dict(corner_radius=8, height=36, font=ctk.CTkFont(family=UI_FONT, size=13), cursor="hand2")
+        options.update(styles)
+        options.update(kwargs)
+        if options.get("state") == "disabled":
+            options["fg_color"] = self._fg_inactif
+        super().__init__(master, **options)
+
+    def configure(self, require_redraw=False, **kwargs):
+        if "state" in kwargs and "fg_color" not in kwargs:
+            kwargs["fg_color"] = self._fg_inactif if kwargs["state"] == "disabled" else self._fg_actif
+        super().configure(require_redraw=require_redraw, **kwargs)
+
+
+def _police(size=13, weight="normal"):
+    return ctk.CTkFont(family=UI_FONT, size=size, weight=weight)
+
+
+def _carte(parent, titre=None, droite=None):
+    """Carte blanche arrondie avec titre optionnel. Retourne (carte, entête, corps)."""
+    carte = ctk.CTkFrame(parent, fg_color=UI_CARD, corner_radius=12, border_width=1, border_color=UI_BORDER)
+    entete = None
+    if titre:
+        entete = ctk.CTkFrame(carte, fg_color="transparent")
+        entete.pack(fill="x", padx=18, pady=(14, 0))
+        ctk.CTkLabel(entete, text=titre, font=_police(14, "bold"), text_color=UI_TEXT).pack(side="left")
+    corps = ctk.CTkFrame(carte, fg_color="transparent")
+    corps.pack(fill="both", expand=True, padx=18, pady=(10, 16))
+    return carte, entete, corps
+
+
+def _libelle_champ(parent, texte):
+    return ctk.CTkLabel(parent, text=texte, font=_police(12, "bold"), text_color=UI_MUTED, anchor="w")
+
+
+def _liste_deroulante(parent, variable, values, **kwargs):
+    options = dict(
+        variable=variable, values=values, height=36, corner_radius=8,
+        fg_color=UI_FIELD, button_color=UI_FIELD, button_hover_color=UI_FIELD_HOVER,
+        text_color=UI_TEXT, text_color_disabled="#A0A7B4",
+        dropdown_fg_color=UI_CARD, dropdown_hover_color=UI_HOVER_LIGHT, dropdown_text_color=UI_TEXT,
+        font=_police(13), dropdown_font=_police(13), dynamic_resizing=False, anchor="w",
+    )
+    options.update(kwargs)
+    return ctk.CTkOptionMenu(parent, **options)
+
+
+# ============================================================
 # Popup final avec choix
 # ============================================================
 def popup_fin_generation_choix(parent, nb_generes):
     result = {"fermer": False}
 
-    top = tk.Toplevel(parent)
+    top = ctk.CTkToplevel(parent)
     top.title("Génération terminée")
-    top.configure(bg="white")
+    top.configure(fg_color=UI_CARD)
     top.resizable(False, False)
     top.transient(parent)
-    top.grab_set()
 
-    largeur = 430
-    hauteur = 170
-    x = parent.winfo_rootx() + 120
-    y = parent.winfo_rooty() + 120
+    largeur = 460
+    hauteur = 200
+    parent.update_idletasks()
+    x = parent.winfo_rootx() + max((parent.winfo_width() - largeur) // 2, 0)
+    y = parent.winfo_rooty() + max((parent.winfo_height() - hauteur) // 2, 0)
     top.geometry(f"{largeur}x{hauteur}+{x}+{y}")
 
-    frame = tk.Frame(top, bg="white", padx=20, pady=20)
-    frame.pack(fill="both", expand=True)
+    frame = ctk.CTkFrame(top, fg_color="transparent")
+    frame.pack(fill="both", expand=True, padx=26, pady=22)
 
-    tk.Label(
+    ligne_titre = ctk.CTkFrame(frame, fg_color="transparent")
+    ligne_titre.pack(fill="x", anchor="w")
+
+    ctk.CTkLabel(
+        ligne_titre, text="✓", text_color=GREEN, font=_police(20, "bold")
+    ).pack(side="left")
+
+    ctk.CTkLabel(
+        ligne_titre, text="Génération terminée", font=_police(16, "bold"), text_color=UI_TEXT
+    ).pack(side="left", padx=(12, 0))
+
+    ctk.CTkLabel(
         frame,
         text=f"Les {nb_generes} reporting(s) ont été générés.",
-        bg="white",
-        fg=TEXT_DARK,
-        font=("Segoe UI", 11)
-    ).pack(anchor="w", pady=(0, 20))
+        font=_police(13),
+        text_color=UI_MUTED,
+        anchor="w"
+    ).pack(fill="x", pady=(14, 0))
 
-    btns = tk.Frame(frame, bg="white")
+    btns = ctk.CTkFrame(frame, fg_color="transparent")
     btns.pack(side="bottom", fill="x")
 
     def rester():
@@ -1363,34 +1467,24 @@ def popup_fin_generation_choix(parent, nb_generes):
         result["fermer"] = True
         top.destroy()
 
-    tk.Button(
-        btns,
-        text="Rester sur cette page",
-        command=rester,
-        bg=WHITE,
-        fg=TEXT_DARK,
-        bd=1,
-        relief="solid"
-    ).pack(side="left")
-
-    tk.Button(
-        btns,
-        text="Fermer",
-        command=fermer,
-        bg=WHITE,
-        fg=TEXT_DARK,
-        bd=1,
-        relief="solid"
-    ).pack(side="right")
+    _Bouton(btns, "primaire", text="Fermer", command=fermer, width=110).pack(side="right")
+    _Bouton(btns, "secondaire", text="Rester sur cette page", command=rester).pack(side="right", padx=(0, 10))
 
     top.protocol("WM_DELETE_WINDOW", rester)
+    try:
+        top.wait_visibility()
+        top.grab_set()
+        top.lift()
+        top.focus_force()
+    except Exception:
+        pass
     parent.wait_window(top)
 
     return result["fermer"]
 
 
 # ============================================================
-# Interface Tkinter - 1 seule étape + presets
+# Interface CustomTkinter - 1 seule étape + presets
 # ============================================================
 def ouvrir_interface():
     ut_code = get_ut_code()
@@ -1400,24 +1494,44 @@ def ouvrir_interface():
     data_validee = False
     df_courant = pd.DataFrame(columns=GUI_COLUMNS)
 
-    root = tk.Tk()
+    ctk.set_appearance_mode("light")
+    ctk.set_default_color_theme("blue")
+
+    root = ctk.CTk()
     root.title("Cockpit - Paramètres de génération")
-    root.configure(bg="white")
+    root.configure(fg_color=UI_BG)
     root.geometry("1160x1020")
     root.minsize(1080, 900)
 
-    try:
-        root.state("zoomed")
-    except Exception:
-        pass
+    def _maximiser():
+        try:
+            root.state("zoomed")
+        except Exception:
+            pass
 
-    style = ttk.Style()
+    root.after(0, _maximiser)
+
+    style = ttk.Style(root)
     try:
         style.theme_use("clam")
     except Exception:
         pass
 
-    style.configure("TCombobox", padding=4)
+    # Style du sélecteur de date (tkcalendar est un widget ttk)
+    style.configure(
+        "Cockpit.DateEntry",
+        fieldbackground=UI_FIELD,
+        background=UI_FIELD,
+        foreground=UI_TEXT,
+        bordercolor=UI_FIELD,
+        lightcolor=UI_FIELD,
+        darkcolor=UI_FIELD,
+        arrowcolor=UI_MUTED,
+        arrowsize=14,
+        padding=(10, 5),
+        relief="flat",
+    )
+    style.map("Cockpit.DateEntry", fieldbackground=[("readonly", UI_FIELD)])
 
     var_perf = tk.StringVar(value=DEFAULT_GUI_VALUES["Performance_type"])
     var_currency = tk.StringVar(value=DEFAULT_GUI_VALUES["Est_currency"])
@@ -1446,6 +1560,7 @@ def ouvrir_interface():
     info_var = tk.StringVar(value="0 Numéro(s) d'intervenant détecté(s)")
     lbl_intro = None
     lbl_output_state = None
+    seg_statement = None
 
     dernier_etat_reference = {"value": None}
     preset_precedent = {"value": ""}
@@ -1457,28 +1572,28 @@ def ouvrir_interface():
     def rafraichir_info_output():
         chemin = var_output_dir.get().strip()
         if not chemin:
-            lbl_output_state.config(
+            lbl_output_state.configure(
                 text="Aucun répertoire output sélectionné",
-                fg=RED
+                text_color=RED
             )
             return
 
         if os.path.isdir(chemin):
-            lbl_output_state.config(
+            lbl_output_state.configure(
                 text=f"Répertoire output : {chemin}",
-                fg=GREEN
+                text_color=GREEN
             )
         else:
-            lbl_output_state.config(
+            lbl_output_state.configure(
                 text=f"Répertoire output invalide ou inaccessible : {chemin}",
-                fg=RED
+                text_color=RED
             )
 
     def mettre_a_jour_compteur(*_):
         liste = get_liste_n_intv()
         info_var.set(f"{len(liste)} Numéro(s) d'intervenant détecté(s)")
         if lbl_intro is not None:
-            lbl_intro.config(
+            lbl_intro.configure(
                 text=f"{len(liste)} Numéro(s) d'intervenant seront traités. Les paramètres ci-dessous seront appliqués à tous."
             )
 
@@ -1550,9 +1665,9 @@ def ouvrir_interface():
         nonlocal data_validee
         data_validee = False
         if lbl_status is not None:
-            lbl_status.config(text="", fg=GREEN)
+            lbl_status.configure(text="", text_color=GREEN)
         if btn_generate is not None:
-            btn_generate.config(state="disabled")
+            btn_generate.configure(state="disabled")
         rafraichir_info_output()
 
     def on_n_intv_change(event=None):
@@ -1565,25 +1680,19 @@ def ouvrir_interface():
         mark_dirty()
 
     def refresh_statement_buttons():
-        mapping = {
-            "STANDARD": btn_standard,
-            "FULL": btn_full,
-            "LIGHT": btn_light,
-        }
-        for name, btn in mapping.items():
-            if selected_statement["value"] == name:
-                btn.config(bg=BLUE, fg=WHITE, activebackground=BLUE, activeforeground=WHITE)
-            else:
-                btn.config(bg=WHITE, fg=TEXT_DARK, activebackground="#efefef", activeforeground=TEXT_DARK)
+        seg_statement.set(selected_statement["value"])
+        # texte blanc sur l'onglet sélectionné, foncé sur les autres
+        for nom, bouton in seg_statement._buttons_dict.items():
+            bouton.configure(text_color=WHITE if nom == selected_statement["value"] else UI_TEXT)
 
     def update_delete_button():
         etat = "normal" if var_preset.get().strip() else "disabled"
-        btn_delete_preset.config(state=etat)
+        btn_delete_preset.configure(state=etat)
 
     def refresh_preset_combo(select=""):
         presets = get_presets_pour_utilisateur(config, ut_code)
         noms = sorted(presets.keys(), key=lambda s: s.lower())
-        cb_preset["values"] = noms
+        cb_preset.configure(values=noms)
         var_preset.set(select if select in noms else "")
         preset_precedent["value"] = var_preset.get()
         update_delete_button()
@@ -1708,7 +1817,7 @@ def ouvrir_interface():
         update_delete_button()
         set_reference_state()
 
-        lbl_status.config(text="✓ Derniers paramètres chargés", fg=GREEN)
+        lbl_status.configure(text="✓ Derniers paramètres chargés", text_color=GREEN)
         log(f"Derniers paramètres chargés pour {ut_code}")
 
     def valider_formulaire(afficher_message_succes=True):
@@ -1731,12 +1840,12 @@ def ouvrir_interface():
         data_validee = True
 
         if afficher_message_succes:
-            lbl_status.config(
+            lbl_status.configure(
                 text=f"✓ Data validée ({len(df_courant)} numéro(s) d'intervenant) | UT : {ut_code}",
-                fg=GREEN
+                text_color=GREEN
             )
 
-        btn_generate.config(state="normal")
+        btn_generate.configure(state="normal")
         log(
             f"DataFrame validé en mémoire. Output dir + derniers paramètres sauvegardés pour "
             f"{ut_code} : {var_output_dir.get().strip()}"
@@ -1744,31 +1853,31 @@ def ouvrir_interface():
         return True
 
     def desactiver_boutons_traitement():
-        btn_valider.config(state="disabled")
-        btn_generate.config(state="disabled")
-        btn_last_params.config(state="disabled")
-        btn_save_preset.config(state="disabled")
-        btn_delete_preset.config(state="disabled")
-        btn_reset.config(state="disabled")
-        cb_preset.config(state="disabled")
+        btn_valider.configure(state="disabled")
+        btn_generate.configure(state="disabled")
+        btn_last_params.configure(state="disabled")
+        btn_save_preset.configure(state="disabled")
+        btn_delete_preset.configure(state="disabled")
+        btn_reset.configure(state="disabled")
+        cb_preset.configure(state="disabled")
 
     def reactiver_boutons_apres_traitement():
-        btn_valider.config(state="normal")
-        btn_generate.config(state="normal" if data_validee else "disabled")
-        btn_last_params.config(state="normal")
-        btn_save_preset.config(state="normal")
-        cb_preset.config(state="readonly")
+        btn_valider.configure(state="normal")
+        btn_generate.configure(state="normal" if data_validee else "disabled")
+        btn_last_params.configure(state="normal")
+        btn_save_preset.configure(state="normal")
+        cb_preset.configure(state="normal")
         update_delete_button()
 
     def afficher_traitement():
-        lbl_processing.config(text="Traitement en cours...")
+        lbl_processing.configure(text="Traitement en cours...")
         progress_bar.pack(side="left", padx=(0, 10))
-        progress_bar.start(12)
+        progress_bar.start()
 
     def masquer_traitement():
         progress_bar.stop()
         progress_bar.pack_forget()
-        lbl_processing.config(text="")
+        lbl_processing.configure(text="")
 
     def coller_presse_papier():
         try:
@@ -1806,7 +1915,7 @@ def ouvrir_interface():
         if not valider_formulaire(afficher_message_succes=False):
             return
 
-        nom = simpledialog.askstring("Enregistrer paramétrage", "Nom du paramétrage :", parent=root)
+        nom = ctk.CTkInputDialog(title="Enregistrer paramétrage", text="Nom du paramétrage :").get_input()
         if nom is None:
             return
 
@@ -1824,7 +1933,7 @@ def ouvrir_interface():
         sauvegarder_config(config)
         refresh_preset_combo(select=nom)
         set_reference_state()
-        lbl_status.config(text=f"✓ Preset enregistré : {nom}", fg=GREEN)
+        lbl_status.configure(text=f"✓ Preset enregistré : {nom}", text_color=GREEN)
         log(f"Preset enregistré pour {ut_code} : {nom}")
 
     def charger_preset(event=None):
@@ -1855,7 +1964,7 @@ def ouvrir_interface():
         preset_precedent["value"] = nom
         set_reference_state()
         update_delete_button()
-        lbl_status.config(text=f"✓ Paramétrage chargé : {nom}", fg=GREEN)
+        lbl_status.configure(text=f"✓ Paramétrage chargé : {nom}", text_color=GREEN)
 
     def supprimer_preset():
         nom = var_preset.get().strip()
@@ -1869,7 +1978,7 @@ def ouvrir_interface():
         presets.pop(nom, None)
         sauvegarder_config(config)
         refresh_preset_combo(select="")
-        lbl_status.config(text=f"✓ Paramétrage supprimé : {nom}", fg=GREEN)
+        lbl_status.configure(text=f"✓ Paramétrage supprimé : {nom}", text_color=GREEN)
         log(f"Paramétrage supprimé pour {ut_code} : {nom}")
 
     def reset_formulaire():
@@ -1909,7 +2018,7 @@ def ouvrir_interface():
 
         set_reference_state()
 
-        lbl_status.config(text="✓ Formulaire réinitialisé", fg=GREEN)
+        lbl_status.configure(text="✓ Formulaire réinitialisé", text_color=GREEN)
 
     def generer():
         nonlocal df_courant
@@ -1952,9 +2061,9 @@ def ouvrir_interface():
                 root.destroy()
             else:
                 reactiver_boutons_apres_traitement()
-                lbl_status.config(
+                lbl_status.configure(
                     text=f"✓ Dernière génération terminée ({nb} reporting(s))",
-                    fg=GREEN
+                    text_color=GREEN
                 )
 
         except Exception as e:
@@ -1968,355 +2077,305 @@ def ouvrir_interface():
     var_signature.trace_add("write", mark_dirty)
     var_output_dir.trace_add("write", mark_dirty)
 
-    top = tk.Frame(root, bg="white", padx=15, pady=15)
-    top.pack(fill="x")
+    # --------------------------------------------------------
+    # Mise en page
+    # --------------------------------------------------------
+    root.grid_columnconfigure(0, weight=1)
+    root.grid_rowconfigure(2, weight=1)
 
-    tk.Label(
-        top,
-        text="Cockpit - Paramètres de génération",
-        bg="white",
-        fg=TEXT_DARK,
-        font=("Segoe UI", 16, "bold")
-    ).pack(anchor="w")
+    # ---- En-tête -------------------------------------------
+    header = ctk.CTkFrame(root, fg_color=UI_PRIMARY, corner_radius=0, height=76)
+    header.grid(row=0, column=0, sticky="ew")
+    header.grid_propagate(False)
+    header.grid_columnconfigure(0, weight=1)
+    header.grid_rowconfigure(0, weight=1)
 
-    lbl_intro = tk.Label(
-        top,
-        text="0 Numéro(s) d'intervenant seront traités. Les paramètres ci-dessous seront appliqués à tous.",
-        bg="white",
-        fg=GRAY,
-        font=("Segoe UI", 10)
-    )
-    lbl_intro.pack(anchor="w", pady=(6, 0))
+    header_gauche = ctk.CTkFrame(header, fg_color="transparent")
+    header_gauche.grid(row=0, column=0, sticky="w", padx=28)
 
-    preset_row = tk.Frame(root, bg="white", padx=15, pady=0)
-    preset_row.pack(fill="x", pady=(0, 10))
-
-    tk.Label(
-        preset_row,
-        text="Paramétrage :",
-        bg="white",
-        fg=TEXT_DARK,
-        font=("Segoe UI", 10)
+    ctk.CTkLabel(
+        header_gauche, text="Cockpit", font=_police(22, "bold"), text_color=WHITE
     ).pack(side="left")
 
-    cb_preset = ttk.Combobox(
-        preset_row,
-        textvariable=var_preset,
-        state="readonly",
-        width=30
-    )
-    cb_preset.pack(side="left", padx=(8, 8))
-    cb_preset.bind("<<ComboboxSelected>>", charger_preset)
+    ctk.CTkLabel(
+        header_gauche, text="  |  Paramètres de génération", font=_police(15), text_color="#C9D6EE"
+    ).pack(side="left", pady=(3, 0))
 
-    btn_last_params = tk.Button(
-        preset_row,
-        text="Derniers paramètres",
-        command=charger_derniers_parametres_ui,
-        bg=WHITE,
-        fg=TEXT_DARK,
-        bd=1,
-        relief="solid"
-    )
+    ctk.CTkLabel(
+        header,
+        text=f"●  {ut_code}",
+        font=_police(12, "bold"),
+        text_color=WHITE,
+        fg_color="#1B4FA6",
+        corner_radius=14,
+        height=28,
+    ).grid(row=0, column=1, sticky="e", padx=28, ipadx=10)
+
+    # ---- Barre des paramétrages ------------------------------
+    preset_row = ctk.CTkFrame(root, fg_color=UI_CARD, corner_radius=12, border_width=1, border_color=UI_BORDER)
+    preset_row.grid(row=1, column=0, sticky="ew", padx=24, pady=(20, 14))
+
+    preset_inner = ctk.CTkFrame(preset_row, fg_color="transparent")
+    preset_inner.pack(fill="x", padx=18, pady=12)
+
+    ctk.CTkLabel(
+        preset_inner, text="Paramétrage", font=_police(13, "bold"), text_color=UI_TEXT
+    ).pack(side="left")
+
+    cb_preset = _liste_deroulante(preset_inner, var_preset, [], width=280, command=charger_preset)
+    cb_preset.pack(side="left", padx=(14, 14))
+
+    btn_last_params = _Bouton(preset_inner, "secondaire", text="Derniers paramètres", command=charger_derniers_parametres_ui)
     btn_last_params.pack(side="left", padx=(0, 8))
 
-    btn_save_preset = tk.Button(
-        preset_row,
-        text="Enregistrer paramétrage",
-        command=enregistrer_preset,
-        bg=WHITE,
-        fg=TEXT_DARK,
-        bd=1,
-        relief="solid"
-    )
+    btn_save_preset = _Bouton(preset_inner, "secondaire", text="Enregistrer le paramétrage", command=enregistrer_preset)
     btn_save_preset.pack(side="left")
 
-    btn_delete_preset = tk.Button(
-        preset_row,
-        text="Supprimer",
-        command=supprimer_preset,
-        bg=WHITE,
-        fg=TEXT_DARK,
-        bd=1,
-        relief="solid",
-        state="disabled"
-    )
-    btn_delete_preset.pack(side="left", padx=(8, 0))
+    btn_reset = _Bouton(preset_inner, "fantome", text="Réinitialiser", command=reset_formulaire, width=110)
+    btn_reset.pack(side="right")
 
-    btn_reset = tk.Button(
-        preset_row,
-        text="Reset",
-        command=reset_formulaire,
-        bg=WHITE,
-        fg=TEXT_DARK,
-        bd=1,
-        relief="solid"
-    )
-    btn_reset.pack(side="left", padx=(8, 0))
+    btn_delete_preset = _Bouton(preset_inner, "danger", text="Supprimer", command=supprimer_preset, state="disabled", width=100)
+    btn_delete_preset.pack(side="right", padx=(0, 8))
 
-    zone_frame = tk.LabelFrame(
-        root,
-        text="Liste des Numéros d'intervenant",
-        bg="white",
-        fg=TEXT_DARK,
-        padx=12,
-        pady=12
-    )
-    zone_frame.pack(fill="both", padx=15, pady=(0, 10))
+    # ---- Corps : 2 colonnes ----------------------------------
+    body = ctk.CTkFrame(root, fg_color="transparent")
+    body.grid(row=2, column=0, sticky="nsew", padx=24, pady=(0, 14))
+    body.grid_columnconfigure(0, weight=5, uniform="col")
+    body.grid_columnconfigure(1, weight=7, uniform="col")
+    body.grid_rowconfigure(0, weight=1)
 
-    txt_n_intv = tk.Text(zone_frame, height=8, wrap="word", font=("Consolas", 11), bd=1, relief="solid")
+    gauche = ctk.CTkFrame(body, fg_color="transparent")
+    gauche.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
+    gauche.grid_columnconfigure(0, weight=1)
+    gauche.grid_rowconfigure(0, weight=1)
+
+    # Colonne gauche : liste des numéros d'intervenant
+    zone_frame, zone_entete, zone_corps = _carte(gauche, "Numéros d'intervenant")
+    zone_frame.grid(row=0, column=0, sticky="nsew", pady=(0, 14))
+
+    ctk.CTkLabel(
+        zone_entete,
+        textvariable=info_var,
+        font=_police(12, "bold"),
+        text_color=GREEN,
+        fg_color=UI_GREEN_BG,
+        corner_radius=12,
+        height=26,
+    ).pack(side="right", ipadx=8)
+
+    lbl_intro = ctk.CTkLabel(
+        zone_corps,
+        text="0 Numéro(s) d'intervenant seront traités. Les paramètres ci-dessous seront appliqués à tous.",
+        font=_police(12),
+        text_color=UI_MUTED,
+        anchor="w",
+        justify="left",
+        wraplength=440,
+    )
+    lbl_intro.pack(fill="x", pady=(0, 10))
+
+    footer_zone = ctk.CTkFrame(zone_corps, fg_color="transparent")
+    footer_zone.pack(side="bottom", fill="x", pady=(12, 0))
+
+    _Bouton(
+        footer_zone, "secondaire", text="Coller depuis le presse-papier", command=coller_presse_papier
+    ).pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+    _Bouton(
+        footer_zone, "secondaire", text="Charger un fichier Excel", command=charger_fichier
+    ).pack(side="left", fill="x", expand=True, padx=(6, 0))
+
+    txt_n_intv = ctk.CTkTextbox(
+        zone_corps,
+        font=ctk.CTkFont(family="Consolas", size=14),
+        fg_color=UI_FIELD,
+        text_color=UI_TEXT,
+        border_width=1,
+        border_color=UI_BORDER,
+        corner_radius=8,
+        wrap="word",
+    )
     txt_n_intv.pack(fill="both", expand=True)
     txt_n_intv.bind("<KeyRelease>", on_n_intv_change)
 
-    footer_zone = tk.Frame(zone_frame, bg="white")
-    footer_zone.pack(fill="x", pady=(10, 0))
+    # Colonne droite : paramètres
+    droite = ctk.CTkFrame(body, fg_color="transparent")
+    droite.grid(row=0, column=1, sticky="nsew", padx=(7, 0))
+    droite.grid_columnconfigure((0, 1), weight=1, uniform="param")
+    droite.grid_rowconfigure(1, weight=1)
 
-    tk.Label(
-        footer_zone,
-        textvariable=info_var,
-        bg="white",
-        fg=GREEN,
-        font=("Segoe UI", 10, "bold")
-    ).pack(side="left")
+    # Statement type
+    stmt_frame, _, stmt_corps = _carte(droite, "Statement Type *")
+    stmt_frame.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 14))
 
-    btns_zone = tk.Frame(footer_zone, bg="white")
-    btns_zone.pack(side="right")
-
-    tk.Button(
-        btns_zone,
-        text="Coller depuis le presse-papier",
-        command=coller_presse_papier,
-        bg=WHITE,
-        fg=TEXT_DARK,
-        bd=1,
-        relief="solid"
-    ).pack(side="left")
-
-    tk.Button(
-        btns_zone,
-        text="Charger un fichier Excel",
-        command=charger_fichier,
-        bg=WHITE,
-        fg=TEXT_DARK,
-        bd=1,
-        relief="solid"
-    ).pack(side="left", padx=(8, 0))
-
-    output_frame = tk.LabelFrame(
-        root,
-        text="Répertoire output",
-        bg="white",
-        fg=TEXT_DARK,
-        padx=12,
-        pady=12
+    seg_statement = ctk.CTkSegmentedButton(
+        stmt_corps,
+        values=["STANDARD", "FULL", "LIGHT"],
+        command=set_statement,
+        height=38,
+        corner_radius=8,
+        font=_police(13, "bold"),
+        fg_color=UI_FIELD,
+        unselected_color=UI_FIELD,
+        unselected_hover_color=UI_FIELD_HOVER,
+        selected_color=UI_PRIMARY,
+        selected_hover_color=UI_PRIMARY_HOVER,
+        text_color=UI_TEXT,
     )
-    output_frame.pack(fill="x", padx=15, pady=(0, 10))
+    seg_statement.pack(fill="x")
 
-    output_top = tk.Frame(output_frame, bg="white")
-    output_top.pack(fill="x")
+    # Paramètres globaux
+    left, _, left_corps = _carte(droite, "Paramètres globaux")
+    left.grid(row=1, column=0, sticky="nsew", padx=(0, 7))
+    left_corps.grid_columnconfigure(0, weight=1)
 
-    tk.Button(
-        output_top,
-        text="Choisir un répertoire",
-        command=choisir_output_dir,
-        bg=WHITE,
-        fg=TEXT_DARK,
-        bd=1,
-        relief="solid"
-    ).pack(side="right")
-
-    tk.Label(
-        output_top,
-        text=f"Utilisateur détecté : {ut_code}",
-        bg="white",
-        fg=GRAY,
-        font=("Segoe UI", 10)
-    ).pack(side="left")
-
-    lbl_output_state = tk.Label(
-        output_frame,
-        text="Aucun répertoire output sélectionné",
-        bg="white",
-        fg=RED,
-        justify="left",
-        wraplength=1000,
-        font=("Segoe UI", 10, "bold")
-    )
-    lbl_output_state.pack(anchor="w", pady=(10, 0))
-
-    main = tk.Frame(root, bg="white", padx=15, pady=5)
-    main.pack(fill="both", expand=True)
-
-    stmt_frame = tk.Frame(main, bg="white")
-    stmt_frame.pack(fill="x", pady=(0, 10))
-
-    tk.Label(
-        stmt_frame,
-        text="Statement Type *",
-        bg="white",
-        fg=TEXT_DARK,
-        font=("Segoe UI", 10, "bold")
-    ).pack(anchor="w")
-
-    stmt_buttons = tk.Frame(stmt_frame, bg="white")
-    stmt_buttons.pack(anchor="w", pady=(8, 0))
-
-    btn_standard = tk.Button(
-        stmt_buttons, text="STANDARD", width=12, bd=1, relief="solid",
-        command=lambda: set_statement("STANDARD")
-    )
-    btn_standard.pack(side="left", padx=(0, 8))
-
-    btn_full = tk.Button(
-        stmt_buttons, text="FULL", width=12, bd=1, relief="solid",
-        command=lambda: set_statement("FULL")
-    )
-    btn_full.pack(side="left", padx=(0, 8))
-
-    btn_light = tk.Button(
-        stmt_buttons, text="LIGHT", width=12, bd=1, relief="solid",
-        command=lambda: set_statement("LIGHT")
-    )
-    btn_light.pack(side="left")
-
-    body = tk.Frame(main, bg="white")
-    body.pack(fill="both", expand=True)
-
-    left = tk.LabelFrame(body, text="GLOBAL STATEMENT PARAMETERS", bg="white", fg=TEXT_DARK, padx=12, pady=12)
-    left.pack(side="left", fill="both", expand=True, padx=(0, 8))
-
-    right = tk.LabelFrame(body, text="OPTIONS", bg="white", fg=TEXT_DARK, padx=12, pady=12)
-    right.pack(side="left", fill="both", expand=True, padx=(8, 0))
-
-    tk.Label(left, text="Date", bg="white", fg=TEXT_DARK).grid(row=0, column=0, sticky="w")
-    date_frame = tk.Frame(left, bg="white")
-    date_frame.grid(row=1, column=0, sticky="we", pady=(0, 10))
+    _libelle_champ(left_corps, "Date").grid(row=0, column=0, sticky="w", pady=(0, 4))
+    date_frame = ctk.CTkFrame(left_corps, fg_color="transparent")
+    date_frame.grid(row=1, column=0, sticky="we", pady=(0, 12))
 
     date_entry = DateEntry(
         date_frame,
+        style="Cockpit.DateEntry",
         date_pattern="dd.mm.yyyy",
-        width=22,
-        background=BLUE,
+        width=14,
+        font=(UI_FONT, 11),
+        background=UI_PRIMARY,
         foreground="white",
-        borderwidth=1
+        headersbackground=UI_HOVER_LIGHT,
+        headersforeground=UI_TEXT,
+        selectbackground=UI_PRIMARY,
+        selectforeground="white",
+        normalbackground="white",
+        weekendbackground="white",
+        othermonthbackground=UI_FIELD,
+        othermonthwebackground=UI_FIELD,
+        bordercolor=UI_BORDER,
+        borderwidth=0
     )
-    date_entry.pack(side="left", fill="x", expand=True)
+    date_entry.pack(side="left", fill="x", expand=True, ipady=2)
     date_entry.set_date(datetime.today())
     date_entry.bind("<<DateEntrySelected>>", mark_dirty)
 
-    tk.Button(
-        date_frame,
-        text="Today",
-        command=set_today,
-        bg=WHITE,
-        fg=TEXT_DARK,
-        bd=1,
-        relief="solid"
-    ).pack(side="left", padx=(8, 0))
+    _Bouton(date_frame, "secondaire", text="Aujourd'hui", command=set_today, width=100).pack(side="left", padx=(8, 0))
 
-    tk.Label(left, text="Estimation currency", bg="white", fg=TEXT_DARK).grid(row=2, column=0, sticky="w")
-    ttk.Combobox(left, textvariable=var_currency, values=LISTE_EST_CURRENCY, state="readonly", width=27).grid(
-        row=3, column=0, sticky="we", pady=(0, 10)
+    _libelle_champ(left_corps, "Estimation currency").grid(row=2, column=0, sticky="w", pady=(0, 4))
+    _liste_deroulante(left_corps, var_currency, LISTE_EST_CURRENCY).grid(row=3, column=0, sticky="we", pady=(0, 12))
+
+    _libelle_champ(left_corps, "Language").grid(row=4, column=0, sticky="w", pady=(0, 4))
+    _liste_deroulante(left_corps, var_lang, LISTE_LANGUAGE).grid(row=5, column=0, sticky="we", pady=(0, 16))
+
+    for i, (texte, var) in enumerate([("Anonymized document", var_anonymized), ("Client Signature", var_signature)]):
+        ctk.CTkSwitch(
+            left_corps,
+            text=texte,
+            variable=var,
+            onvalue=True,
+            offvalue=False,
+            font=_police(13),
+            text_color=UI_TEXT,
+            progress_color=UI_PRIMARY,
+            button_color=WHITE,
+            button_hover_color=UI_HOVER_LIGHT,
+            fg_color="#CBD3DF",
+            switch_width=40,
+            switch_height=20,
+        ).grid(row=6 + i, column=0, sticky="w", pady=(0, 10))
+
+    # Options
+    right, _, right_corps = _carte(droite, "Options")
+    right.grid(row=1, column=1, sticky="nsew", padx=(7, 0))
+    right_corps.grid_columnconfigure(0, weight=1)
+
+    _libelle_champ(right_corps, "Performance type").grid(row=0, column=0, sticky="w", pady=(0, 4))
+    _liste_deroulante(right_corps, var_perf, LISTE_PERFORMANCE_TYPE).grid(row=1, column=0, sticky="we", pady=(0, 12))
+
+    _libelle_champ(right_corps, "Monthly perf history").grid(row=2, column=0, sticky="w", pady=(0, 4))
+    _liste_deroulante(right_corps, var_monthly, LISTE_MONTHLY).grid(row=3, column=0, sticky="we", pady=(0, 12))
+
+    _libelle_champ(right_corps, "Annual perf history").grid(row=4, column=0, sticky="w", pady=(0, 4))
+    _liste_deroulante(right_corps, var_annual, LISTE_ANNUAL).grid(row=5, column=0, sticky="we", pady=(0, 12))
+
+    ctk.CTkLabel(
+        right_corps,
+        text="ⓘ  Le File Name est généré automatiquement par le robot.",
+        font=_police(12),
+        text_color=UI_MUTED,
+        anchor="w",
+        justify="left",
+        wraplength=260,
+    ).grid(row=6, column=0, sticky="w", pady=(4, 0))
+
+    # Répertoire output
+    output_frame, output_top, output_corps = _carte(gauche, "Répertoire output")
+    output_frame.grid(row=1, column=0, sticky="ew")
+
+    _Bouton(output_top, "secondaire", text="Choisir un répertoire", command=choisir_output_dir).pack(side="right")
+
+    ctk.CTkLabel(
+        output_corps,
+        text=f"Utilisateur détecté : {ut_code}",
+        font=_police(12),
+        text_color=UI_MUTED,
+        anchor="w",
+    ).pack(fill="x")
+
+    lbl_output_state = ctk.CTkLabel(
+        output_corps,
+        text="Aucun répertoire output sélectionné",
+        text_color=RED,
+        anchor="w",
+        justify="left",
+        wraplength=440,
+        font=_police(13, "bold"),
     )
+    lbl_output_state.pack(fill="x", pady=(6, 0))
 
-    tk.Label(left, text="Language", bg="white", fg=TEXT_DARK).grid(row=4, column=0, sticky="w")
-    ttk.Combobox(left, textvariable=var_lang, values=LISTE_LANGUAGE, state="readonly", width=27).grid(
-        row=5, column=0, sticky="we", pady=(0, 10)
-    )
+    # ---- Pied de page : statut + actions ---------------------
+    bottom = ctk.CTkFrame(root, fg_color=UI_CARD, corner_radius=0, height=72, border_width=0)
+    bottom.grid(row=3, column=0, sticky="ew")
+    bottom.grid_propagate(False)
+    bottom.grid_columnconfigure(0, weight=1)
+    bottom.grid_rowconfigure(1, weight=1)
 
-    tk.Checkbutton(
-        left,
-        text="Anonymized document",
-        variable=var_anonymized,
-        bg="white",
-        fg=TEXT_DARK,
-        activebackground="white",
-        activeforeground=TEXT_DARK,
-        selectcolor="white"
-    ).grid(row=6, column=0, sticky="w", pady=(4, 4))
+    ctk.CTkFrame(bottom, fg_color=UI_BORDER, height=1, corner_radius=0).grid(row=0, column=0, columnspan=2, sticky="ew")
 
-    tk.Checkbutton(
-        left,
-        text="Client Signature",
-        variable=var_signature,
-        bg="white",
-        fg=TEXT_DARK,
-        activebackground="white",
-        activeforeground=TEXT_DARK,
-        selectcolor="white"
-    ).grid(row=7, column=0, sticky="w", pady=(0, 10))
+    status_frame = ctk.CTkFrame(bottom, fg_color="transparent")
+    status_frame.grid(row=1, column=0, sticky="w", padx=28)
 
-    left.grid_columnconfigure(0, weight=1)
-
-    tk.Label(right, text="Performance type", bg="white", fg=TEXT_DARK).grid(row=0, column=0, sticky="w")
-    ttk.Combobox(right, textvariable=var_perf, values=LISTE_PERFORMANCE_TYPE, state="readonly", width=27).grid(
-        row=1, column=0, sticky="we", pady=(0, 10)
-    )
-
-    tk.Label(right, text="Monthly perf history", bg="white", fg=TEXT_DARK).grid(row=2, column=0, sticky="w")
-    ttk.Combobox(right, textvariable=var_monthly, values=LISTE_MONTHLY, state="readonly", width=27).grid(
-        row=3, column=0, sticky="we", pady=(0, 10)
-    )
-
-    tk.Label(right, text="Annual perf history", bg="white", fg=TEXT_DARK).grid(row=4, column=0, sticky="w")
-    ttk.Combobox(right, textvariable=var_annual, values=LISTE_ANNUAL, state="readonly", width=27).grid(
-        row=5, column=0, sticky="we", pady=(0, 10)
-    )
-
-    tk.Label(
-        right,
-        text="Le File Name est généré automatiquement par le robot.",
-        bg="white",
-        fg=GRAY
-    ).grid(row=6, column=0, sticky="w", pady=(8, 0))
-
-    right.grid_columnconfigure(0, weight=1)
-
-    bottom = tk.Frame(root, bg="white", padx=15, pady=15)
-    bottom.pack(fill="x")
-
-    status_frame = tk.Frame(bottom, bg="white")
-    status_frame.pack(side="left")
-
-    lbl_status = tk.Label(status_frame, text="", bg="white", fg=GREEN, font=("Segoe UI", 10, "bold"))
+    lbl_status = ctk.CTkLabel(status_frame, text="", text_color=GREEN, font=_police(13, "bold"))
     lbl_status.pack(side="left", padx=(0, 20))
 
-    lbl_processing = tk.Label(
+    progress_bar = ctk.CTkProgressBar(
+        status_frame,
+        mode="indeterminate",
+        width=180,
+        height=6,
+        progress_color=UI_PRIMARY,
+        fg_color=UI_FIELD_HOVER,
+    )
+
+    lbl_processing = ctk.CTkLabel(
         status_frame,
         text="",
-        bg="white",
-        fg=GRAY,
-        font=("Segoe UI", 10, "italic")
+        text_color=UI_MUTED,
+        font=ctk.CTkFont(family=UI_FONT, size=13, slant="italic")
     )
     lbl_processing.pack(side="left")
 
-    progress_bar = ttk.Progressbar(
-        status_frame,
-        mode="indeterminate",
-        length=160
-    )
+    actions = ctk.CTkFrame(bottom, fg_color="transparent")
+    actions.grid(row=1, column=1, sticky="e", padx=28)
 
-    btn_generate = tk.Button(
-        bottom,
-        text="GENERER",
-        command=generer,
-        bg=WHITE,
-        fg=TEXT_DARK,
-        bd=1,
-        relief="solid",
-        state="disabled"
+    btn_valider = _Bouton(
+        actions, "secondaire", text="VALIDER", command=valider,
+        width=140, height=42, font=_police(14, "bold")
     )
-    btn_generate.pack(side="right")
+    btn_valider.pack(side="left", padx=(0, 12))
 
-    btn_valider = tk.Button(
-        bottom,
-        text="VALIDER",
-        command=valider,
-        bg=WHITE,
-        fg=TEXT_DARK,
-        bd=1,
-        relief="solid"
+    btn_generate = _Bouton(
+        actions, "primaire", text="GÉNÉRER", command=generer, state="disabled",
+        width=160, height=42, font=_police(14, "bold")
     )
-    btn_valider.pack(side="right", padx=(0, 12))
+    btn_generate.pack(side="left")
 
     refresh_statement_buttons()
     mettre_a_jour_compteur()
