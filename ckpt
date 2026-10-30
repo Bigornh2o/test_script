@@ -2,6 +2,7 @@ import re
 import time
 import os
 import json
+import base64
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -21,7 +22,6 @@ if sys.stdout is not None:
 # Paramètres
 # ============================================================
 URL_LOGIN = "https://cockpitind.ch.pbk/#/login"
-CHEMIN_MDP = r"P:\CPSI_CONTROL_DATA\SAS_DATA\LES3\Robot_Cockpit\Input\mdpBIIQJ_cockpit.xlsx"
 CHROME_PATH = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
 
 # JSON de config par utilisateur
@@ -71,6 +71,7 @@ SEL_ROWS = "div.ag-center-cols-container div[role='row']"
 SEL_CELL_RELATION = "div[col-id='relationshipNumber']"
 
 TIMEOUT_CHAMP_MS = 60000
+DELAI_ECHEC_LOGIN_SEC = 15  # page de login toujours affichée après ce délai = identifiants refusés
 INTERVALLE_NOTIFS_SEC = 3
 TIMEOUT_NOTIFS_MIN = 30
 
@@ -108,10 +109,15 @@ LISTE_ANNUAL = [str(y) for y in range(2012, datetime.today().year + 1)]
 # =========================
 # Identifiants Cockpit
 # =========================
-mdp = pd.read_excel(CHEMIN_MDP)
-mdp = list(mdp.values.tolist())
-USERNAME = mdp[0][0]
-PASSWORD = mdp[0][1]
+# Saisis dans l'interface au premier lancement puis stockés dans le JSON de config.
+# Le mot de passe y est chiffré avec DPAPI (Windows) : seule la session Windows
+# qui l'a enregistré peut le relire.
+USERNAME = ""
+PASSWORD = ""
+
+
+class EchecConnexionCockpit(Exception):
+    """Cockpit a refusé les identifiants (la page de login reste affichée)."""
 
 
 # ============================================================
@@ -206,6 +212,9 @@ def migrer_structure_config(data):
                 "presets": presets,
                 "last_params": last_params
             }
+
+            if isinstance(val.get("identifiants"), dict):
+                nouveau[cle]["identifiants"] = val["identifiants"]
         else:
             nouveau[cle] = {
                 "output_path": "",
@@ -291,6 +300,89 @@ def sauvegarder_last_params_pour_utilisateur(config, ut_code, payload):
 def charger_last_params_pour_utilisateur(config, ut_code):
     val = get_user_cfg(config, ut_code).get("last_params", {})
     return val if isinstance(val, dict) else {}
+
+
+# ============================================================
+# Identifiants Cockpit (mot de passe chiffré DPAPI)
+# ============================================================
+_DPAPI_ENTROPIE = b"Robot_Cockpit"
+
+
+def _dpapi(donnees, chiffrer):
+    """Chiffre/déchiffre avec DPAPI : lié à la session Windows de l'utilisateur."""
+    if os.name != "nt":
+        raise RuntimeError("Le chiffrement DPAPI n'est disponible que sous Windows.")
+
+    import ctypes
+    from ctypes import wintypes
+
+    class DATA_BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    def blob(octets):
+        tampon = ctypes.create_string_buffer(octets, len(octets))
+        return DATA_BLOB(len(octets), ctypes.cast(tampon, ctypes.POINTER(ctypes.c_char))), tampon
+
+    entree, _tampon_entree = blob(donnees)
+    entropie, _tampon_entropie = blob(_DPAPI_ENTROPIE)
+    sortie = DATA_BLOB()
+
+    CRYPTPROTECT_UI_FORBIDDEN = 0x01
+    crypt32 = ctypes.windll.crypt32
+    fonction = crypt32.CryptProtectData if chiffrer else crypt32.CryptUnprotectData
+
+    ok = fonction(
+        ctypes.byref(entree), None, ctypes.byref(entropie),
+        None, None, CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(sortie)
+    )
+    if not ok:
+        raise ctypes.WinError()
+
+    try:
+        return ctypes.string_at(sortie.pbData, sortie.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(sortie.pbData)
+
+
+def chiffrer_mot_de_passe(mot_de_passe):
+    return base64.b64encode(_dpapi(mot_de_passe.encode("utf-8"), chiffrer=True)).decode("ascii")
+
+
+def dechiffrer_mot_de_passe(valeur):
+    return _dpapi(base64.b64decode(valeur), chiffrer=False).decode("utf-8")
+
+
+def charger_identifiants_pour_utilisateur(config, ut_code):
+    """Retourne (username, password). password vaut None s'il est absent ou illisible."""
+    bloc = get_user_cfg(config, ut_code).get("identifiants", {})
+    if not isinstance(bloc, dict):
+        return "", None
+
+    username = str(bloc.get("username", "")).strip()
+    chiffre = bloc.get("password_dpapi", "")
+    if not username or not chiffre:
+        return username, None
+
+    try:
+        return username, dechiffrer_mot_de_passe(chiffre)
+    except Exception as e:
+        log(f"ATTENTION : mot de passe enregistré illisible ({e}), nouvelle saisie nécessaire.")
+        return username, None
+
+
+def sauvegarder_identifiants_pour_utilisateur(config, ut_code, username, password):
+    get_user_cfg(config, ut_code)["identifiants"] = {
+        "username": str(username).strip(),
+        "password_dpapi": chiffrer_mot_de_passe(password),
+        "mis_a_jour_le": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def appliquer_identifiants(username, password):
+    """Rend les identifiants disponibles pour connexion()."""
+    global USERNAME, PASSWORD
+    USERNAME = username
+    PASSWORD = password
 
 
 # ============================================================
@@ -840,6 +932,16 @@ def connexion(page):
     page.locator(SEL_PASSWORD).fill(PASSWORD)
 
     page.locator(SEL_SUBMIT).click()
+
+    # Identifiants refusés : la page de login reste affichée au lieu de charger Cockpit
+    debut = time.time()
+    while not page.locator(SEL_CHAMP_RELATION).first.is_visible():
+        ecoule = time.time() - debut
+        if ecoule > DELAI_ECHEC_LOGIN_SEC and page.locator(SEL_PASSWORD).first.is_visible():
+            raise EchecConnexionCockpit("Cockpit a refusé l'identifiant ou le mot de passe.")
+        if ecoule > TIMEOUT_CHAMP_MS / 1000:
+            break
+        page.wait_for_timeout(500)
 
     attendre_champ_relation_actif(page)
     log("Connexion réussie.")
@@ -1484,6 +1586,215 @@ def popup_fin_generation_choix(parent, nb_generes):
 
 
 # ============================================================
+# Modale de saisie des identifiants Cockpit
+# ============================================================
+def _icone_oeil(barre=False, couleur=UI_MUTED, fond=UI_FIELD, taille=20):
+    """Icône œil (ou œil barré) dessinée avec Pillow, nette quel que soit l'écran."""
+    from PIL import Image, ImageDraw
+
+    f = 6
+    s = taille * f
+    img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    epaisseur = max(f, int(s * 0.085))
+
+    d.ellipse((int(s * 0.06), int(s * 0.24), int(s * 0.94), int(s * 0.76)), outline=couleur, width=epaisseur)
+    r = int(s * 0.13)
+    d.ellipse((s // 2 - r, s // 2 - r, s // 2 + r, s // 2 + r), fill=couleur)
+
+    if barre:
+        d.line((int(s * 0.16), int(s * 0.86), int(s * 0.84), int(s * 0.14)), fill=fond, width=epaisseur * 3)
+        d.line((int(s * 0.16), int(s * 0.86), int(s * 0.84), int(s * 0.14)), fill=couleur, width=epaisseur)
+
+    img = img.resize((taille * 2, taille * 2), Image.LANCZOS)
+    return ctk.CTkImage(light_image=img, size=(taille, taille))
+
+
+def modale_identifiants(root, username_initial="", message=None, obligatoire=False, enregistrer=None):
+    """
+    Affiche une carte de connexion par-dessus la fenêtre principale floutée.
+    - obligatoire=True : pas de bouton Annuler, fermer la fenêtre quitte le robot.
+    - enregistrer(username, password) : appelé à la validation ; une exception
+      s'affiche dans la carte et la modale reste ouverte.
+    Retourne (username, password) ou None si annulé.
+    """
+    resultat = {"valeur": None, "quitter": False}
+    termine = tk.BooleanVar(master=root, value=False)
+
+    root.update_idletasks()
+    root.update()
+
+    # ---- Fond : capture de la fenêtre, floutée -----------------
+    largeur = max(root.winfo_width(), 1)
+    hauteur = max(root.winfo_height(), 1)
+    try:
+        echelle = ctk.ScalingTracker.get_widget_scaling(root)
+    except Exception:
+        echelle = 1.0
+
+    image_fond = None
+    couleur_coins = UI_BG
+    try:
+        from PIL import Image, ImageFilter, ImageGrab
+
+        x, y = root.winfo_rootx(), root.winfo_rooty()
+        capture = ImageGrab.grab(bbox=(x, y, x + largeur, y + hauteur), all_screens=True).convert("RGB")
+        capture = capture.filter(ImageFilter.GaussianBlur(radius=12))
+        capture = Image.blend(capture, Image.new("RGB", capture.size, "#0F1B33"), 0.30)
+
+        cx, cy = capture.size[0] // 2, capture.size[1] // 2
+        r, g, b = capture.crop((cx - 260, cy - 200, cx + 260, cy + 200)).resize((1, 1)).getpixel((0, 0))
+        couleur_coins = f"#{r:02x}{g:02x}{b:02x}"
+
+        image_fond = ctk.CTkImage(light_image=capture, size=(largeur / echelle, hauteur / echelle))
+    except Exception as e:
+        log(f"Flou d'arrière-plan indisponible ({e}), fond uni utilisé.")
+        couleur_coins = "#8C95A6"
+
+    calque = ctk.CTkLabel(root, text="", image=image_fond, fg_color=couleur_coins, corner_radius=0)
+    calque.place(x=0, y=0, relwidth=1, relheight=1)
+    calque.lift()
+
+    # ---- Carte de connexion ------------------------------------
+    carte = ctk.CTkFrame(
+        root, fg_color=UI_CARD, bg_color=couleur_coins, corner_radius=12,
+        border_width=1, border_color=UI_BORDER
+    )
+    carte.place(relx=0.5, rely=0.5, anchor="center")
+    carte.lift()
+
+    contenu = ctk.CTkFrame(carte, fg_color="transparent")
+    contenu.pack(padx=44, pady=(36, 34))
+
+    ctk.CTkLabel(contenu, text="Connexion à Cockpit", font=_police(24, "bold"), text_color=UI_TEXT).pack()
+
+    ctk.CTkLabel(
+        contenu,
+        text="Tes identifiants sont enregistrés chiffrés sur ce poste.\nTu pourras les modifier à tout moment.",
+        font=_police(12),
+        text_color=UI_MUTED,
+        justify="center",
+    ).pack(pady=(6, 24))
+
+    if message:
+        ctk.CTkLabel(
+            contenu,
+            text=message,
+            font=_police(12, "bold"),
+            text_color=RED,
+            fg_color="#FDECEA",
+            corner_radius=8,
+            wraplength=380,
+            justify="left",
+        ).pack(fill="x", pady=(0, 16), ipadx=10, ipady=8)
+
+    style_champ = dict(
+        width=400, height=46, corner_radius=8, border_width=1, border_color="#CBD3DF",
+        fg_color=UI_CARD, text_color=UI_TEXT, placeholder_text_color="#8A93A3", font=_police(14),
+    )
+
+    e_user = ctk.CTkEntry(contenu, placeholder_text="Username", **style_champ)
+    e_user.pack(pady=(0, 14))
+    if username_initial:
+        e_user.insert(0, username_initial)
+
+    e_pwd = ctk.CTkEntry(contenu, placeholder_text="Password", show="•", **style_champ)
+    e_pwd.pack()
+
+    icones = {
+        "voir": _icone_oeil(barre=False, couleur=UI_TEXT, fond=UI_CARD),
+        "masquer": _icone_oeil(barre=True, couleur=UI_TEXT, fond=UI_CARD),
+    }
+    etat_mdp = {"visible": False}
+
+    def basculer_visibilite():
+        etat_mdp["visible"] = not etat_mdp["visible"]
+        e_pwd.configure(show="" if etat_mdp["visible"] else "•")
+        btn_oeil.configure(image=icones["masquer" if etat_mdp["visible"] else "voir"])
+        e_pwd.focus_set()
+
+    btn_oeil = ctk.CTkButton(
+        contenu, text="", image=icones["voir"], width=34, height=34, corner_radius=6,
+        fg_color=UI_CARD, hover_color=UI_HOVER_LIGHT, command=basculer_visibilite, cursor="hand2"
+    )
+    btn_oeil.place(in_=e_pwd, relx=1.0, x=-6, rely=0.5, anchor="e")
+
+    lbl_erreur = ctk.CTkLabel(contenu, text="", font=_police(12), text_color=RED, wraplength=400, justify="left")
+    lbl_erreur.pack(fill="x", pady=(8, 0))
+
+    boutons = ctk.CTkFrame(contenu, fg_color="transparent")
+    boutons.pack(fill="x", pady=(10, 0))
+
+    def valider(*_):
+        username = e_user.get().strip()
+        password = e_pwd.get()
+        if not username or not password:
+            lbl_erreur.configure(text="Merci de renseigner l'identifiant et le mot de passe.")
+            return
+        if enregistrer is not None:
+            try:
+                enregistrer(username, password)
+            except Exception as e:
+                lbl_erreur.configure(text=f"Enregistrement impossible : {e}")
+                return
+        resultat["valeur"] = (username, password)
+        termine.set(True)
+
+    def annuler(*_):
+        if obligatoire:
+            return
+        termine.set(True)
+
+    _Bouton(
+        boutons, "primaire", text="Enregistrer", command=valider,
+        width=130, height=42, font=_police(14, "bold")
+    ).pack(side="right")
+
+    if not obligatoire:
+        _Bouton(boutons, "secondaire", text="Annuler", command=annuler, width=110, height=42).pack(side="right", padx=(0, 10))
+
+    for champ in (e_user, e_pwd):
+        champ.bind("<Return>", valider)
+        champ.bind("<Escape>", annuler)
+        champ.bind("<Key>", lambda event: lbl_erreur.configure(text="") if event.keysym != "Return" else None)
+
+    # ---- Blocage du reste de la fenêtre pendant la saisie ------
+    redimensionnable = root.resizable()
+    root.resizable(False, False)
+    ancien_protocole = root.protocol("WM_DELETE_WINDOW")
+
+    def fermeture_fenetre():
+        if obligatoire:
+            resultat["quitter"] = True
+        termine.set(True)
+
+    root.protocol("WM_DELETE_WINDOW", fermeture_fenetre)
+
+    try:
+        carte.grab_set()
+    except Exception:
+        pass
+    (e_pwd if username_initial else e_user).focus_set()
+
+    root.wait_variable(termine)
+
+    try:
+        carte.grab_release()
+    except Exception:
+        pass
+    carte.destroy()
+    calque.destroy()
+    root.resizable(*redimensionnable)
+    root.protocol("WM_DELETE_WINDOW", ancien_protocole or root.destroy)
+
+    if resultat["quitter"]:
+        root.destroy()
+        return None
+
+    return resultat["valeur"]
+
+
+# ============================================================
 # Interface CustomTkinter - 1 seule étape + presets
 # ============================================================
 def ouvrir_interface():
@@ -2020,6 +2331,40 @@ def ouvrir_interface():
 
         lbl_status.configure(text="✓ Formulaire réinitialisé", text_color=GREEN)
 
+    def demander_identifiants_ui(message=None, obligatoire=False):
+        username_enregistre, _ = charger_identifiants_pour_utilisateur(config, ut_code)
+
+        def enregistrer(username, password):
+            sauvegarder_identifiants_pour_utilisateur(config, ut_code, username, password)
+            sauvegarder_config(config)
+
+        resultat = modale_identifiants(
+            root,
+            username_initial=username_enregistre or USERNAME,
+            message=message,
+            obligatoire=obligatoire,
+            enregistrer=enregistrer,
+        )
+        if resultat is None:
+            return False
+
+        appliquer_identifiants(*resultat)
+        if lbl_status.winfo_exists():
+            lbl_status.configure(text="✓ Identifiants Cockpit enregistrés", text_color=GREEN)
+        log(f"Identifiants Cockpit enregistrés pour {ut_code}")
+        return True
+
+    def verifier_identifiants_au_demarrage():
+        username, password = charger_identifiants_pour_utilisateur(config, ut_code)
+        if username and password:
+            appliquer_identifiants(username, password)
+            return
+
+        message = None
+        if username:
+            message = "Le mot de passe enregistré n'est pas lisible sur ce poste. Merci de le ressaisir."
+        demander_identifiants_ui(message=message, obligatoire=True)
+
     def generer():
         nonlocal df_courant
         if not data_validee:
@@ -2066,6 +2411,16 @@ def ouvrir_interface():
                     text_color=GREEN
                 )
 
+        except EchecConnexionCockpit:
+            masquer_traitement()
+            reactiver_boutons_apres_traitement()
+            log("Connexion refusée par Cockpit : demande de nouveaux identifiants.")
+            if demander_identifiants_ui(
+                message="Cockpit a refusé tes identifiants (mot de passe expiré ?). "
+                        "Mets-les à jour : la génération sera relancée automatiquement."
+            ):
+                generer()
+
         except Exception as e:
             masquer_traitement()
             reactiver_boutons_apres_traitement()
@@ -2109,7 +2464,20 @@ def ouvrir_interface():
         fg_color="#1B4FA6",
         corner_radius=14,
         height=28,
-    ).grid(row=0, column=1, sticky="e", padx=28, ipadx=10)
+    ).grid(row=0, column=1, sticky="e", padx=(28, 10), ipadx=10)
+
+    ctk.CTkButton(
+        header,
+        text="Modifier les identifiants",
+        command=lambda: demander_identifiants_ui(),
+        font=_police(12, "bold"),
+        text_color=WHITE,
+        fg_color="#1B4FA6",
+        hover_color="#2A5FBA",
+        corner_radius=14,
+        height=28,
+        cursor="hand2",
+    ).grid(row=0, column=2, sticky="e", padx=(0, 28))
 
     # ---- Barre des paramétrages ------------------------------
     preset_row = ctk.CTkFrame(root, fg_color=UI_CARD, corner_radius=12, border_width=1, border_color=UI_BORDER)
@@ -2382,6 +2750,7 @@ def ouvrir_interface():
     rafraichir_info_output()
     refresh_preset_combo(select="")
     set_reference_state()
+    root.after(300, verifier_identifiants_au_demarrage)
     root.mainloop()
 
 
