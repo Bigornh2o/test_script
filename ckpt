@@ -2143,8 +2143,13 @@ def ouvrir_interface():
             bouton.configure(text_color=WHITE if nom == selected_statement["value"] else UI_TEXT)
 
     def update_delete_button():
-        etat = "normal" if var_preset.get().strip() else "disabled"
-        btn_delete_preset.configure(state=etat)
+        # Visible uniquement quand un paramétrage est sélectionné dans la liste
+        if var_preset.get().strip():
+            btn_delete_preset.configure(state="normal")
+            if not btn_delete_preset.winfo_manager():
+                btn_delete_preset.pack(side="right", padx=(0, 8), after=btn_reset)
+        else:
+            btn_delete_preset.pack_forget()
 
     def refresh_preset_combo(select=""):
         presets = get_presets_pour_utilisateur(config, ut_code)
@@ -2772,8 +2777,8 @@ def ouvrir_interface():
     btn_reset = _Bouton(preset_inner, "fantome", text="Réinitialiser", command=reset_formulaire, width=110)
     btn_reset.pack(side="right")
 
-    btn_delete_preset = _Bouton(preset_inner, "danger", text="Supprimer", command=supprimer_preset, state="disabled", width=100)
-    btn_delete_preset.pack(side="right", padx=(0, 8))
+    btn_delete_preset = _Bouton(preset_inner, "danger", text="Supprimer le paramétrage", command=supprimer_preset)
+    # affiché par update_delete_button() dès qu'un paramétrage est choisi
 
     # ---- Corps : 2 colonnes ----------------------------------
     body = ctk.CTkFrame(root, fg_color="transparent")
