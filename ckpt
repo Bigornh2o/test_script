@@ -108,6 +108,9 @@ def generer_liste_monthly():
 LISTE_MONTHLY = generer_liste_monthly()
 LISTE_ANNUAL = [str(y) for y in range(2012, datetime.today().year + 1)]
 
+# Libellé affiché dans l'interface pour un champ facultatif laissé vide dans Cockpit
+OPTION_VIDE = "— Vide —"
+
 # =========================
 # Identifiants Cockpit
 # =========================
@@ -653,9 +656,58 @@ def lire_valeur_ng_select(page, formcontrolname):
         return ""
 
 
+def ng_select_est_vide(page, formcontrolname):
+    """True si la liste Cockpit n'a aucune valeur sélectionnée (champ vidé avec la croix)."""
+    base = page.locator(f'[formcontrolname="{formcontrolname}"]').first
+    try:
+        base.wait_for(state="visible", timeout=5000)
+        return base.locator(".ng-value").count() == 0 and base.locator(".ng-value-label").count() == 0
+    except Exception:
+        return False
+
+
+def lire_valeur_ng_select_facultatif(page, formcontrolname):
+    """Comme lire_valeur_ng_select, mais renvoie "" pour un champ vide
+    (sinon le texte de la croix ou du placeholder serait lu comme une valeur)."""
+    if ng_select_est_vide(page, formcontrolname):
+        return ""
+    return lire_valeur_ng_select(page, formcontrolname)
+
+
+def vider_ng_select(page, formcontrolname, libelle=None):
+    """Vide une liste Cockpit via sa croix (×), avec repli sur Retour arrière."""
+    if ng_select_est_vide(page, formcontrolname):
+        log(f"{libelle or formcontrolname} déjà vide")
+        return
+
+    log(f"Mise à jour {libelle or formcontrolname} : vidage du champ")
+
+    champ = page.locator(f'[formcontrolname="{formcontrolname}"]').first
+    champ.wait_for(state="visible", timeout=15000)
+    champ.scroll_into_view_if_needed()
+
+    croix = champ.locator(".ng-clear-wrapper").first
+    if croix.count() > 0 and croix.is_visible():
+        croix.click()
+    else:
+        champ.click()
+        input_interne = champ.locator("input").first
+        input_interne.wait_for(state="visible", timeout=5000)
+        input_interne.fill("")
+        input_interne.press("Backspace")
+        input_interne.press("Escape")
+
+    page.wait_for_timeout(300)
+
+
 def remplir_ng_select_si_necessaire(page, formcontrolname, value, libelle=None):
-    actuel = lire_valeur_ng_select(page, formcontrolname)
     attendu = str(value).strip()
+
+    if not attendu:
+        vider_ng_select(page, formcontrolname, libelle)
+        return
+
+    actuel = lire_valeur_ng_select(page, formcontrolname)
 
     if valeurs_egales(actuel, attendu):
         log(f"{libelle or formcontrolname} déjà correct : {attendu}")
@@ -816,8 +868,8 @@ def lire_parametres_modale(page, ligne):
         "PerformanceType": lire_valeur_ng_select(page, "performanceType"),
         "Est_currency": lire_valeur_ng_select(page, "estimationCurrency"),
         "Language": lire_valeur_ng_select(page, "language"),
-        "Monthly_perf_history": lire_valeur_ng_select(page, "monthlyPerformanceFrom"),
-        "Annual_perf_history": lire_valeur_ng_select(page, "annualPerformanceFrom"),
+        "Monthly_perf_history": lire_valeur_ng_select_facultatif(page, "monthlyPerformanceFrom"),
+        "Annual_perf_history": lire_valeur_ng_select_facultatif(page, "annualPerformanceFrom"),
         "Anonymized_document": lire_checkbox(page, "anonymizedDocument"),
         "Client_signature": lire_checkbox(page, "bienTrouve"),
         "FileName": lire_file_name(page),
@@ -1952,6 +2004,16 @@ def ouvrir_interface():
     preset_precedent = {"value": ""}
     suivi = {"en_cours": False, "arret": None, "echecs": 0, "fermer_apres": False}
 
+    def valeur_liste(var):
+        """Valeur à envoyer au robot : "" si l'option « Vide » est choisie."""
+        valeur = var.get().strip()
+        return "" if valeur == OPTION_VIDE else valeur
+
+    def afficher_liste(valeur):
+        """Valeur à afficher dans une liste facultative : « Vide » si elle est vide."""
+        valeur = str(valeur if valeur is not None else "").strip()
+        return valeur if valeur else OPTION_VIDE
+
     def get_liste_n_intv():
         contenu = txt_n_intv.get("1.0", "end")
         return extraire_n_intv_depuis_texte(contenu)
@@ -2034,8 +2096,8 @@ def ouvrir_interface():
                 "anonymized": bool(var_anonymized.get()),
                 "signature": bool(var_signature.get()),
                 "performance_type": var_perf.get().strip(),
-                "monthly_perf_history": var_monthly.get().strip(),
-                "annual_perf_history": var_annual.get().strip(),
+                "monthly_perf_history": valeur_liste(var_monthly),
+                "annual_perf_history": valeur_liste(var_annual),
                 "output_path": var_output_dir.get().strip(),
             }
         }
@@ -2147,8 +2209,8 @@ def ouvrir_interface():
             df_local.at[idx, "Performance_type"] = var_perf.get().strip()
             df_local.at[idx, "Est_currency"] = var_currency.get().strip()
             df_local.at[idx, "Language"] = var_lang.get().strip()
-            df_local.at[idx, "Monthly_perf_history"] = var_monthly.get().strip()
-            df_local.at[idx, "Annual_perf_history"] = var_annual.get().strip()
+            df_local.at[idx, "Monthly_perf_history"] = valeur_liste(var_monthly)
+            df_local.at[idx, "Annual_perf_history"] = valeur_liste(var_annual)
             df_local.at[idx, "Anonymized_document"] = bool(var_anonymized.get())
             df_local.at[idx, "Client_signature"] = bool(var_signature.get())
 
@@ -2170,8 +2232,9 @@ def ouvrir_interface():
         var_anonymized.set(bool(params.get("anonymized", DEFAULT_GUI_VALUES["Anonymized_document"])))
         var_signature.set(bool(params.get("signature", DEFAULT_GUI_VALUES["Client_signature"])))
         var_perf.set(str(params.get("performance_type", DEFAULT_GUI_VALUES["Performance_type"])).strip() or DEFAULT_GUI_VALUES["Performance_type"])
-        var_monthly.set(str(params.get("monthly_perf_history", DEFAULT_GUI_VALUES["Monthly_perf_history"])).strip() or DEFAULT_GUI_VALUES["Monthly_perf_history"])
-        var_annual.set(str(params.get("annual_perf_history", DEFAULT_GUI_VALUES["Annual_perf_history"])).strip() or DEFAULT_GUI_VALUES["Annual_perf_history"])
+        # Champs facultatifs : une valeur vide enregistrée reste vide
+        var_monthly.set(afficher_liste(params.get("monthly_perf_history", DEFAULT_GUI_VALUES["Monthly_perf_history"])))
+        var_annual.set(afficher_liste(params.get("annual_perf_history", DEFAULT_GUI_VALUES["Annual_perf_history"])))
 
         output_path_preset = str(params.get("output_path", "")).strip()
         if output_path_preset:
@@ -2865,10 +2928,10 @@ def ouvrir_interface():
     _liste_deroulante(right_corps, var_perf, LISTE_PERFORMANCE_TYPE).grid(row=1, column=0, sticky="we", pady=(0, 12))
 
     _libelle_champ(right_corps, "Monthly perf history").grid(row=2, column=0, sticky="w", pady=(0, 4))
-    _liste_deroulante(right_corps, var_monthly, LISTE_MONTHLY).grid(row=3, column=0, sticky="we", pady=(0, 12))
+    _liste_deroulante(right_corps, var_monthly, [OPTION_VIDE] + LISTE_MONTHLY).grid(row=3, column=0, sticky="we", pady=(0, 12))
 
     _libelle_champ(right_corps, "Annual perf history").grid(row=4, column=0, sticky="w", pady=(0, 4))
-    _liste_deroulante(right_corps, var_annual, LISTE_ANNUAL).grid(row=5, column=0, sticky="we", pady=(0, 12))
+    _liste_deroulante(right_corps, var_annual, [OPTION_VIDE] + LISTE_ANNUAL).grid(row=5, column=0, sticky="we", pady=(0, 12))
 
     ctk.CTkLabel(
         right_corps,
