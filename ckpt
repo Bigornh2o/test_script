@@ -1991,10 +1991,20 @@ def _capturer_fenetre(root):
     ).convert("RGB")
 
 
-def _ouvrir_fond_flou(root):
-    """Recouvre la fenêtre d'une capture d'elle-même floutée. Retourne l'état du fond."""
+FOND_UNI = "#EEF1F5"  # blanc grisé, derrière la fenêtre des identifiants au premier lancement
+
+
+def _ouvrir_fond_flou(root, uni=False):
+    """Recouvre la fenêtre d'une capture d'elle-même floutée (ou d'un fond uni blanc grisé
+    si uni=True). Retourne l'état du fond."""
     root.update_idletasks()
     root.update()
+
+    if uni:
+        calque = ctk.CTkLabel(root, text="", fg_color=FOND_UNI, corner_radius=0)
+        calque.place(x=0, y=0, relwidth=1, relheight=1)
+        calque.lift()
+        return {"calque": calque, "couleur": FOND_UNI, "id_configure": None}
 
     largeur = max(root.winfo_width(), 1)
     hauteur = max(root.winfo_height(), 1)
@@ -2011,7 +2021,7 @@ def _ouvrir_fond_flou(root):
 
         capture = _capturer_fenetre(root)
         capture = capture.filter(ImageFilter.GaussianBlur(radius=12))
-        capture = Image.blend(capture, Image.new("RGB", capture.size, "#EEF1F5"), 0.60)  # voile blanc grisé
+        capture = Image.blend(capture, Image.new("RGB", capture.size, "#0F1B33"), 0.30)
 
         cx, cy = capture.size[0] // 2, capture.size[1] // 2
         r, g, b = capture.crop((cx - 260, cy - 200, cx + 260, cy + 200)).resize((1, 1)).getpixel((0, 0))
@@ -2021,7 +2031,7 @@ def _ouvrir_fond_flou(root):
         image_fond = ctk.CTkImage(light_image=capture, size=(largeur / echelle, hauteur / echelle))
     except Exception as e:
         log(f"Flou d'arrière-plan indisponible ({e}), fond uni utilisé.")
-        couleur_coins = "#E2E6EC"
+        couleur_coins = "#8C95A6"
 
     calque = ctk.CTkLabel(root, text="", image=image_fond, fg_color=couleur_coins, corner_radius=0)
     calque.place(x=0, y=0, relwidth=1, relheight=1)
@@ -2084,14 +2094,16 @@ def _attendre_modale(root, fond, carte, termine, resultat, obligatoire, focus=No
         pass
     carte.destroy()
     fond["calque"].destroy()
-    try:
-        root.unbind("<Configure>", fond["id_configure"])
-    except Exception:
-        pass
+    if fond.get("id_configure"):
+        try:
+            root.unbind("<Configure>", fond["id_configure"])
+        except Exception:
+            pass
     root.protocol("WM_DELETE_WINDOW", ancien_protocole or root.destroy)
 
 
-def modale_identifiants(root, username_initial="", message=None, obligatoire=False, enregistrer=None):
+def modale_identifiants(root, username_initial="", message=None, obligatoire=False, enregistrer=None,
+                        fond_uni=False):
     """
     Affiche une carte de connexion par-dessus la fenêtre principale floutée.
     - obligatoire=True : pas de bouton Annuler, fermer la fenêtre quitte le robot.
@@ -2102,13 +2114,13 @@ def modale_identifiants(root, username_initial="", message=None, obligatoire=Fal
     resultat = {"valeur": None, "quitter": False}
     termine = tk.BooleanVar(master=root, value=False)
 
-    fond = _ouvrir_fond_flou(root)
+    fond = _ouvrir_fond_flou(root, uni=fond_uni)
     couleur_coins = fond["couleur"]
 
     # ---- Carte de connexion ------------------------------------
     carte = ctk.CTkFrame(
         root, fg_color=UI_CARD, bg_color=couleur_coins, corner_radius=12,
-        border_width=1, border_color="#CFD6E1"
+        border_width=1, border_color=UI_BORDER
     )
     # placée à l'écran par _attendre_modale, une fois entièrement construite
 
@@ -2272,7 +2284,7 @@ def modale_parametres_avances(root, valeurs):
 
     carte = ctk.CTkFrame(
         root, fg_color=UI_CARD, bg_color=fond["couleur"], corner_radius=12,
-        border_width=1, border_color="#CFD6E1"
+        border_width=1, border_color=UI_BORDER
     )
     # placée à l'écran par _attendre_modale, une fois entièrement construite
 
@@ -3123,7 +3135,7 @@ def ouvrir_interface():
 
         lbl_status.configure(text="✓ Formulaire réinitialisé", text_color=GREEN)
 
-    def demander_identifiants_ui(message=None, obligatoire=False):
+    def demander_identifiants_ui(message=None, obligatoire=False, fond_uni=False):
         username_enregistre, _ = charger_identifiants_pour_utilisateur(config, ut_code)
 
         def enregistrer(username, password):
@@ -3136,6 +3148,7 @@ def ouvrir_interface():
             message=message,
             obligatoire=obligatoire,
             enregistrer=enregistrer,
+            fond_uni=fond_uni,
         )
         if resultat is None:
             return False
@@ -3163,7 +3176,7 @@ def ouvrir_interface():
         message = None
         if username:
             message = "Le mot de passe enregistré n'est pas lisible sur ce poste. Merci de le ressaisir."
-        demander_identifiants_ui(message=message, obligatoire=True)
+        demander_identifiants_ui(message=message, obligatoire=True, fond_uni=True)
 
     def generer():
         nonlocal df_courant
