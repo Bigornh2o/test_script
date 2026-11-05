@@ -2127,15 +2127,7 @@ def modale_identifiants(root, username_initial="", message=None, obligatoire=Fal
     contenu = ctk.CTkFrame(carte, fg_color="transparent")
     contenu.pack(padx=44, pady=(36, 34))
 
-    ctk.CTkLabel(contenu, text="Connexion à Cockpit", font=_police(24, "bold"), text_color=UI_TEXT).pack()
-
-    ctk.CTkLabel(
-        contenu,
-        text="Tes identifiants sont enregistrés chiffrés sur ce poste.\nTu pourras les modifier à tout moment.",
-        font=_police(12),
-        text_color=UI_MUTED,
-        justify="center",
-    ).pack(pady=(6, 24))
+    ctk.CTkLabel(contenu, text="Connexion à Cockpit", font=_police(24, "bold"), text_color=UI_TEXT).pack(pady=(0, 24))
 
     if message:
         ctk.CTkLabel(
