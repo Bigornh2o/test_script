@@ -1908,6 +1908,89 @@ def _icone_oeil(barre=False, couleur=UI_MUTED, fond=UI_FIELD, taille=20):
     return ctk.CTkImage(light_image=img, size=(taille, taille))
 
 
+def _capturer_fenetre(root):
+    """
+    Image du contenu de la fenêtre. Sous Windows, capture la fenêtre elle-même
+    (PrintWindow) : le résultat est juste même si une autre application est
+    devant ou si la fenêtre vient d'apparaître. Sinon, capture de l'écran.
+    """
+    from PIL import Image, ImageGrab
+
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32, gdi32 = ctypes.windll.user32, ctypes.windll.gdi32
+            P = ctypes.c_void_p
+            user32.GetParent.restype = P
+            user32.GetParent.argtypes = [P]
+            user32.GetClientRect.argtypes = [P, ctypes.POINTER(wintypes.RECT)]
+            user32.GetDC.restype = P
+            user32.GetDC.argtypes = [P]
+            user32.ReleaseDC.argtypes = [P, P]
+            user32.PrintWindow.argtypes = [P, P, wintypes.UINT]
+            gdi32.CreateCompatibleDC.restype = P
+            gdi32.CreateCompatibleDC.argtypes = [P]
+            gdi32.CreateCompatibleBitmap.restype = P
+            gdi32.CreateCompatibleBitmap.argtypes = [P, ctypes.c_int, ctypes.c_int]
+            gdi32.SelectObject.restype = P
+            gdi32.SelectObject.argtypes = [P, P]
+            gdi32.DeleteObject.argtypes = [P]
+            gdi32.DeleteDC.argtypes = [P]
+
+            class BITMAPINFOHEADER(ctypes.Structure):
+                _fields_ = [
+                    ("biSize", wintypes.DWORD), ("biWidth", wintypes.LONG), ("biHeight", wintypes.LONG),
+                    ("biPlanes", wintypes.WORD), ("biBitCount", wintypes.WORD), ("biCompression", wintypes.DWORD),
+                    ("biSizeImage", wintypes.DWORD), ("biXPelsPerMeter", wintypes.LONG),
+                    ("biYPelsPerMeter", wintypes.LONG), ("biClrUsed", wintypes.DWORD),
+                    ("biClrImportant", wintypes.DWORD),
+                ]
+
+            gdi32.GetDIBits.argtypes = [P, P, wintypes.UINT, wintypes.UINT, P, ctypes.POINTER(BITMAPINFOHEADER), wintypes.UINT]
+
+            hwnd = user32.GetParent(root.winfo_id()) or root.winfo_id()
+            rect = wintypes.RECT()
+            user32.GetClientRect(hwnd, ctypes.byref(rect))
+            largeur, hauteur = rect.right - rect.left, rect.bottom - rect.top
+
+            hdc_fenetre = user32.GetDC(hwnd)
+            hdc = gdi32.CreateCompatibleDC(hdc_fenetre)
+            bitmap = gdi32.CreateCompatibleBitmap(hdc_fenetre, largeur, hauteur)
+            ancien = gdi32.SelectObject(hdc, bitmap)
+            try:
+                PW_CLIENTONLY_RENDERFULLCONTENT = 0x1 | 0x2
+                if not user32.PrintWindow(hwnd, hdc, PW_CLIENTONLY_RENDERFULLCONTENT):
+                    raise OSError("PrintWindow a échoué")
+                gdi32.SelectObject(hdc, ancien)  # le bitmap doit être libre pour GetDIBits
+
+                entete = BITMAPINFOHEADER()
+                entete.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+                entete.biWidth, entete.biHeight = largeur, -hauteur  # négatif : de haut en bas
+                entete.biPlanes, entete.biBitCount, entete.biCompression = 1, 32, 0
+                tampon = ctypes.create_string_buffer(largeur * hauteur * 4)
+                if not gdi32.GetDIBits(hdc, bitmap, 0, hauteur, tampon, ctypes.byref(entete), 0):
+                    raise OSError("GetDIBits a échoué")
+                image = Image.frombuffer("RGB", (largeur, hauteur), tampon, "raw", "BGRX", 0, 1).copy()
+            finally:
+                gdi32.SelectObject(hdc, ancien)
+                gdi32.DeleteObject(bitmap)
+                gdi32.DeleteDC(hdc)
+                user32.ReleaseDC(hwnd, hdc_fenetre)
+
+            if image.convert("L").getextrema()[1] > 20:  # image entièrement noire = capture ratée
+                return image
+            log("Capture de la fenêtre vide, capture d'écran utilisée.")
+        except Exception as e:
+            log(f"Capture de la fenêtre impossible ({e}), capture d'écran utilisée.")
+
+    x, y = root.winfo_rootx(), root.winfo_rooty()
+    return ImageGrab.grab(
+        bbox=(x, y, x + max(root.winfo_width(), 1), y + max(root.winfo_height(), 1)), all_screens=True
+    ).convert("RGB")
+
+
 def _ouvrir_fond_flou(root):
     """Recouvre la fenêtre d'une capture d'elle-même floutée. Retourne l'état du fond."""
     root.update_idletasks()
@@ -1924,10 +2007,9 @@ def _ouvrir_fond_flou(root):
     capture_fond = None
     couleur_coins = UI_BG
     try:
-        from PIL import Image, ImageFilter, ImageGrab
+        from PIL import Image, ImageFilter
 
-        x, y = root.winfo_rootx(), root.winfo_rooty()
-        capture = ImageGrab.grab(bbox=(x, y, x + largeur, y + hauteur), all_screens=True).convert("RGB")
+        capture = _capturer_fenetre(root)
         capture = capture.filter(ImageFilter.GaussianBlur(radius=12))
         capture = Image.blend(capture, Image.new("RGB", capture.size, "#0F1B33"), 0.30)
 
@@ -3060,6 +3142,14 @@ def ouvrir_interface():
         if username and password:
             appliquer_identifiants(username, password)
             return
+
+        # Fenêtre au premier plan et entièrement dessinée avant le flou
+        try:
+            root.lift()
+            root.focus_force()
+            root.update()
+        except Exception:
+            pass
 
         message = None
         if username:
