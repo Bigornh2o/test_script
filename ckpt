@@ -2,7 +2,10 @@ import re
 import time
 import os
 import json
+import base64
 import tempfile
+import queue
+import threading
 from datetime import datetime
 from pathlib import Path
 import pandas as pd
@@ -21,7 +24,6 @@ if sys.stdout is not None:
 # Paramètres
 # ============================================================
 URL_LOGIN = "https://cockpitind.ch.pbk/#/login"
-CHEMIN_MDP = r"P:\CPSI_CONTROL_DATA\SAS_DATA\LES3\Robot_Cockpit\Input\mdpBIIQJ_cockpit.xlsx"
 CHROME_PATH = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
 
 # JSON de config par utilisateur
@@ -71,6 +73,7 @@ SEL_ROWS = "div.ag-center-cols-container div[role='row']"
 SEL_CELL_RELATION = "div[col-id='relationshipNumber']"
 
 TIMEOUT_CHAMP_MS = 60000
+DELAI_ECHEC_LOGIN_SEC = 15  # page de login toujours affichée après ce délai = identifiants refusés
 INTERVALLE_NOTIFS_SEC = 3
 TIMEOUT_NOTIFS_MIN = 30
 
@@ -105,13 +108,90 @@ def generer_liste_monthly():
 LISTE_MONTHLY = generer_liste_monthly()
 LISTE_ANNUAL = [str(y) for y in range(2012, datetime.today().year + 1)]
 
+# Libellé affiché dans l'interface pour un champ facultatif laissé vide dans Cockpit
+OPTION_VIDE = "— Vide —"
+
+# Paramètres avancés : blocs situés sous OPTIONS dans la fenêtre Cockpit.
+# Ils ne sont appliqués par le robot que si l'utilisateur les a activés ;
+# sinon Cockpit garde ses propres valeurs.
+# (section, formcontrolname, libellé Cockpit, genre, retrait)
+POSITIONS_CHOIX = ["NO POSITIONS", "WITH POSITIONS"]
+LONGUEUR_MAX_COMMENTAIRE = 600
+PARAMS_AVANCES = [
+    ("POSITIONS PARAMETERS", "accountDetails", "Positions", "positions", 0),
+    ("POSITIONS PARAMETERS", "taxData", "Tax data for French residents", "case", 0),
+    ("OPTIONAL PAGES", "tableOfContent", "Table of content", "case", 0),
+    ("OPTIONAL PAGES", "lifeInsuranceReporting", "Life insurance reporting", "case", 0),
+    ("OPTIONAL PAGES", "indexEvolution", "Index evolution", "case", 0),
+    ("OPTIONAL PAGES", "historyMovements", "History of movements", "case", 0),
+    ("CONSOLIDATED VIEW PAGES", "assetSummary", "Summary of Assets & Key Information", "case", 0),
+    ("CONSOLIDATED VIEW PAGES", "openingDate", "Opening date", "case", 1),
+    ("CONSOLIDATED VIEW PAGES", "capGainLoss", "Capital Gains or Losses & Accrued Interests", "case", 1),
+    ("CONSOLIDATED VIEW PAGES", "commitments", "Synthesis of commitments", "case", 1),
+    ("CONSOLIDATED VIEW PAGES", "keyInformationComment", "Key Information", "texte", 1),
+    ("CONSOLIDATED VIEW PAGES", "breakdownByCurrency", "Breakdown of net asset by currency", "case", 0),
+    ("CONSOLIDATED VIEW PAGES", "focusSharesBonds", "Focus Shares & Bonds", "case", 0),
+    ("CONSOLIDATED VIEW PAGES", "incomeSchedule", "Income Schedule", "case", 0),
+    ("COMMENTS", "coverPage", "Cover page", "case", 0),
+    ("COMMENTS", "coverPageComment", "Cover page comment", "texte", 1),
+]
+
+# Valeurs de départ = état relevé dans Cockpit (extraction du 05/11/2026)
+AVANCES_DEFAUT = {
+    "actif": False,
+    "accountDetails": "WITH POSITIONS",
+    "taxData": True,
+    "tableOfContent": True,
+    "lifeInsuranceReporting": True,
+    "indexEvolution": False,
+    "historyMovements": True,
+    "assetSummary": True,
+    "openingDate": True,
+    "capGainLoss": True,
+    "commitments": True,
+    "keyInformationComment": "",
+    "breakdownByCurrency": False,
+    "focusSharesBonds": True,
+    "incomeSchedule": True,
+    "coverPage": True,
+    "coverPageComment": "",
+}
+
+
+def normaliser_avances(valeur):
+    """Complète et nettoie un dictionnaire de paramètres avancés (preset, JSON, DataFrame)."""
+    if isinstance(valeur, str) and valeur.strip():
+        try:
+            valeur = json.loads(valeur)
+        except Exception:
+            valeur = {}
+    if not isinstance(valeur, dict):
+        valeur = {}
+
+    resultat = {"actif": bool(valeur.get("actif", AVANCES_DEFAUT["actif"]))}
+    for _, fcn, _, genre, _ in PARAMS_AVANCES:
+        brut = valeur.get(fcn, AVANCES_DEFAUT[fcn])
+        if genre == "positions":
+            brut = str(brut or "").strip().upper()
+            resultat[fcn] = brut if brut in POSITIONS_CHOIX else AVANCES_DEFAUT[fcn]
+        elif genre == "case":
+            resultat[fcn] = bool(brut)
+        else:
+            resultat[fcn] = str(brut if brut is not None else "")[:LONGUEUR_MAX_COMMENTAIRE]
+    return resultat
+
 # =========================
 # Identifiants Cockpit
 # =========================
-mdp = pd.read_excel(CHEMIN_MDP)
-mdp = list(mdp.values.tolist())
-USERNAME = mdp[0][0]
-PASSWORD = mdp[0][1]
+# Saisis dans l'interface au premier lancement puis stockés dans le JSON de config.
+# Le mot de passe y est chiffré avec DPAPI (Windows) : seule la session Windows
+# qui l'a enregistré peut le relire.
+USERNAME = ""
+PASSWORD = ""
+
+
+class EchecConnexionCockpit(Exception):
+    """Cockpit a refusé les identifiants (la page de login reste affichée)."""
 
 
 # ============================================================
@@ -206,6 +286,9 @@ def migrer_structure_config(data):
                 "presets": presets,
                 "last_params": last_params
             }
+
+            if isinstance(val.get("identifiants"), dict):
+                nouveau[cle]["identifiants"] = val["identifiants"]
         else:
             nouveau[cle] = {
                 "output_path": "",
@@ -291,6 +374,89 @@ def sauvegarder_last_params_pour_utilisateur(config, ut_code, payload):
 def charger_last_params_pour_utilisateur(config, ut_code):
     val = get_user_cfg(config, ut_code).get("last_params", {})
     return val if isinstance(val, dict) else {}
+
+
+# ============================================================
+# Identifiants Cockpit (mot de passe chiffré DPAPI)
+# ============================================================
+_DPAPI_ENTROPIE = b"Robot_Cockpit"
+
+
+def _dpapi(donnees, chiffrer):
+    """Chiffre/déchiffre avec DPAPI : lié à la session Windows de l'utilisateur."""
+    if os.name != "nt":
+        raise RuntimeError("Le chiffrement DPAPI n'est disponible que sous Windows.")
+
+    import ctypes
+    from ctypes import wintypes
+
+    class DATA_BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    def blob(octets):
+        tampon = ctypes.create_string_buffer(octets, len(octets))
+        return DATA_BLOB(len(octets), ctypes.cast(tampon, ctypes.POINTER(ctypes.c_char))), tampon
+
+    entree, _tampon_entree = blob(donnees)
+    entropie, _tampon_entropie = blob(_DPAPI_ENTROPIE)
+    sortie = DATA_BLOB()
+
+    CRYPTPROTECT_UI_FORBIDDEN = 0x01
+    crypt32 = ctypes.windll.crypt32
+    fonction = crypt32.CryptProtectData if chiffrer else crypt32.CryptUnprotectData
+
+    ok = fonction(
+        ctypes.byref(entree), None, ctypes.byref(entropie),
+        None, None, CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(sortie)
+    )
+    if not ok:
+        raise ctypes.WinError()
+
+    try:
+        return ctypes.string_at(sortie.pbData, sortie.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(sortie.pbData)
+
+
+def chiffrer_mot_de_passe(mot_de_passe):
+    return base64.b64encode(_dpapi(mot_de_passe.encode("utf-8"), chiffrer=True)).decode("ascii")
+
+
+def dechiffrer_mot_de_passe(valeur):
+    return _dpapi(base64.b64decode(valeur), chiffrer=False).decode("utf-8")
+
+
+def charger_identifiants_pour_utilisateur(config, ut_code):
+    """Retourne (username, password). password vaut None s'il est absent ou illisible."""
+    bloc = get_user_cfg(config, ut_code).get("identifiants", {})
+    if not isinstance(bloc, dict):
+        return "", None
+
+    username = str(bloc.get("username", "")).strip()
+    chiffre = bloc.get("password_dpapi", "")
+    if not username or not chiffre:
+        return username, None
+
+    try:
+        return username, dechiffrer_mot_de_passe(chiffre)
+    except Exception as e:
+        log(f"ATTENTION : mot de passe enregistré illisible ({e}), nouvelle saisie nécessaire.")
+        return username, None
+
+
+def sauvegarder_identifiants_pour_utilisateur(config, ut_code, username, password):
+    get_user_cfg(config, ut_code)["identifiants"] = {
+        "username": str(username).strip(),
+        "password_dpapi": chiffrer_mot_de_passe(password),
+        "mis_a_jour_le": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def appliquer_identifiants(username, password):
+    """Rend les identifiants disponibles pour connexion()."""
+    global USERNAME, PASSWORD
+    USERNAME = username
+    PASSWORD = password
 
 
 # ============================================================
@@ -442,6 +608,7 @@ def lire_lignes_depuis_df(df):
             "Annual_perf_history": normaliser_texte(row["Annual_perf_history"]),
             "Anonymized_document": to_bool(row["Anonymized_document"]),
             "Client_signature": to_bool(row["Client_signature"]),
+            "Avances": normaliser_avances(row["Parametres_avances"]) if "Parametres_avances" in df.columns else None,
         })
 
     return resultats
@@ -559,9 +726,65 @@ def lire_valeur_ng_select(page, formcontrolname):
         return ""
 
 
+def ng_select_est_vide(page, formcontrolname):
+    """True si la liste Cockpit n'a aucune valeur sélectionnée (champ vidé avec la croix)."""
+    base = page.locator(f'[formcontrolname="{formcontrolname}"]').first
+    try:
+        base.wait_for(state="visible", timeout=5000)
+        valeur = base.locator(".ng-value").first
+        if valeur.count() == 0:
+            return True
+        # option vide sélectionnée : libellé vide (seule la croix « × » peut apparaître)
+        libelle = valeur.locator(".ng-value-label").first
+        source = libelle if libelle.count() > 0 else valeur
+        texte = (source.inner_text() or "").replace("×", "").strip()
+        return texte == ""
+    except Exception:
+        return False
+
+
+def lire_valeur_ng_select_facultatif(page, formcontrolname):
+    """Comme lire_valeur_ng_select, mais renvoie "" pour un champ vide
+    (sinon le texte de la croix ou du placeholder serait lu comme une valeur)."""
+    if ng_select_est_vide(page, formcontrolname):
+        return ""
+    return lire_valeur_ng_select(page, formcontrolname)
+
+
+def vider_ng_select(page, formcontrolname, libelle=None):
+    """Vide une liste Cockpit via sa croix (×), avec repli sur Retour arrière."""
+    if ng_select_est_vide(page, formcontrolname):
+        log(f"{libelle or formcontrolname} déjà vide")
+        return
+
+    log(f"Mise à jour {libelle or formcontrolname} : vidage du champ")
+
+    champ = page.locator(f'[formcontrolname="{formcontrolname}"]').first
+    champ.wait_for(state="visible", timeout=15000)
+    champ.scroll_into_view_if_needed()
+
+    croix = champ.locator(".ng-clear-wrapper").first
+    if croix.count() > 0 and croix.is_visible():
+        croix.click()
+    else:
+        champ.click()
+        input_interne = champ.locator("input").first
+        input_interne.wait_for(state="visible", timeout=5000)
+        input_interne.fill("")
+        input_interne.press("Backspace")
+        input_interne.press("Escape")
+
+    page.wait_for_timeout(300)
+
+
 def remplir_ng_select_si_necessaire(page, formcontrolname, value, libelle=None):
-    actuel = lire_valeur_ng_select(page, formcontrolname)
     attendu = str(value).strip()
+
+    if not attendu:
+        vider_ng_select(page, formcontrolname, libelle)
+        return
+
+    actuel = lire_valeur_ng_select(page, formcontrolname)
 
     if valeurs_egales(actuel, attendu):
         log(f"{libelle or formcontrolname} déjà correct : {attendu}")
@@ -579,6 +802,107 @@ def remplir_ng_select_si_necessaire(page, formcontrolname, value, libelle=None):
     input_interne.fill("")
     input_interne.type(attendu, delay=50)
     input_interne.press("Enter")
+
+
+def _bouton_positions(page, choix):
+    groupe = page.locator('[formcontrolname="accountDetails"]').first
+    groupe.wait_for(state="visible", timeout=15000)
+    return groupe.locator("button").filter(
+        has_text=re.compile(rf"^\s*{re.escape(choix)}\s*$", re.I)
+    ).first
+
+
+def lire_positions(page):
+    for choix in POSITIONS_CHOIX:
+        try:
+            classes = (_bouton_positions(page, choix).get_attribute("class") or "").lower()
+            if "selected" in classes or "active" in classes:
+                return choix
+        except Exception:
+            pass
+    return ""
+
+
+def regler_positions_si_necessaire(page, choix):
+    if valeurs_egales(lire_positions(page), choix):
+        log(f"Positions déjà correct : {choix}")
+        return
+    log(f"Mise à jour Positions : {choix}")
+    btn = _bouton_positions(page, choix)
+    btn.scroll_into_view_if_needed()
+    btn.click()
+
+
+def _champ_modifiable(page, selecteur):
+    """Renvoie le champ s'il est affiché et actif dans Cockpit, sinon None."""
+    champ = page.locator(selecteur).first
+    try:
+        champ.wait_for(state="visible", timeout=3000)
+        return None if champ.is_disabled() else champ
+    except Exception:
+        return None
+
+
+def lire_texte_long(page, formcontrolname):
+    champ = _champ_modifiable(page, f'textarea[formcontrolname="{formcontrolname}"]')
+    if champ is None:
+        return None
+    try:
+        return champ.input_value()
+    except Exception:
+        return None
+
+
+def appliquer_parametres_avances(page, avances):
+    """Règle les blocs sous OPTIONS. Ne fait rien si les paramètres avancés ne sont pas activés."""
+    if not avances or not avances.get("actif"):
+        return
+
+    for _, fcn, libelle, genre, _ in PARAMS_AVANCES:
+        attendu = avances.get(fcn)
+        if genre == "positions":
+            regler_positions_si_necessaire(page, attendu)
+        elif genre == "case":
+            cb = _champ_modifiable(page, f'input[formcontrolname="{fcn}"]')
+            if cb is None:
+                log(f"{libelle} non modifiable dans Cockpit (masqué ou grisé), ignoré.")
+                continue
+            if cb.is_checked() != bool(attendu):
+                log(f"Mise à jour {libelle} : {'coché' if attendu else 'décoché'}")
+                regler_checkbox(page, fcn, bool(attendu))
+        else:
+            champ = _champ_modifiable(page, f'textarea[formcontrolname="{fcn}"]')
+            if champ is None:
+                log(f"{libelle} non modifiable dans Cockpit (masqué ou grisé), ignoré.")
+                continue
+            if champ.input_value() != attendu:
+                log(f"Mise à jour {libelle} ({len(attendu)} caractère(s))")
+                champ.scroll_into_view_if_needed()
+                champ.fill(attendu)
+
+
+def ecarts_parametres_avances(page, avances):
+    if not avances or not avances.get("actif"):
+        return []
+
+    ecarts = []
+    for _, fcn, libelle, genre, _ in PARAMS_AVANCES:
+        attendu = avances.get(fcn)
+        if genre == "positions":
+            lu = lire_positions(page)
+            if not valeurs_egales(lu, attendu):
+                ecarts.append(f"{libelle}: lu='{lu}' attendu='{attendu}'")
+        elif genre == "case":
+            if _champ_modifiable(page, f'input[formcontrolname="{fcn}"]') is None:
+                continue
+            lu = lire_checkbox(page, fcn)
+            if not bool_egal(lu, attendu):
+                ecarts.append(f"{libelle}: lu='{lu}' attendu='{attendu}'")
+        else:
+            lu = lire_texte_long(page, fcn)
+            if lu is not None and lu != attendu:
+                ecarts.append(f"{libelle}: {len(lu)} caractère(s) lus, {len(attendu)} attendus")
+    return ecarts
 
 
 def regler_checkbox(page, formcontrolname, cocher):
@@ -722,8 +1046,8 @@ def lire_parametres_modale(page, ligne):
         "PerformanceType": lire_valeur_ng_select(page, "performanceType"),
         "Est_currency": lire_valeur_ng_select(page, "estimationCurrency"),
         "Language": lire_valeur_ng_select(page, "language"),
-        "Monthly_perf_history": lire_valeur_ng_select(page, "monthlyPerformanceFrom"),
-        "Annual_perf_history": lire_valeur_ng_select(page, "annualPerformanceFrom"),
+        "Monthly_perf_history": lire_valeur_ng_select_facultatif(page, "monthlyPerformanceFrom"),
+        "Annual_perf_history": lire_valeur_ng_select_facultatif(page, "annualPerformanceFrom"),
         "Anonymized_document": lire_checkbox(page, "anonymizedDocument"),
         "Client_signature": lire_checkbox(page, "bienTrouve"),
         "FileName": lire_file_name(page),
@@ -772,6 +1096,8 @@ def comparer_parametres_modale(page, ligne):
     if lus["FileName"] != lus["FileNameAttendu"]:
         ecarts.append(f"FileName: lu='{lus['FileName']}' attendu='{lus['FileNameAttendu']}'")
 
+    ecarts.extend(ecarts_parametres_avances(page, ligne.get("Avances")))
+
     return ecarts, lus
 
 
@@ -796,6 +1122,7 @@ def verifier_et_corriger_parametres_avant_generate(page, ligne):
         regler_checkbox(page, "anonymizedDocument", ligne["Anonymized_document"])
         regler_checkbox(page, "bienTrouve", ligne["Client_signature"])
         remplir_file_name_si_necessaire(page, ligne["N_intv"], ligne["StatementType"])
+        appliquer_parametres_avances(page, ligne.get("Avances"))
 
         page.wait_for_timeout(500)
 
@@ -840,6 +1167,16 @@ def connexion(page):
     page.locator(SEL_PASSWORD).fill(PASSWORD)
 
     page.locator(SEL_SUBMIT).click()
+
+    # Identifiants refusés : la page de login reste affichée au lieu de charger Cockpit
+    debut = time.time()
+    while not page.locator(SEL_CHAMP_RELATION).first.is_visible():
+        ecoule = time.time() - debut
+        if ecoule > DELAI_ECHEC_LOGIN_SEC and page.locator(SEL_PASSWORD).first.is_visible():
+            raise EchecConnexionCockpit("Cockpit a refusé l'identifiant ou le mot de passe.")
+        if ecoule > TIMEOUT_CHAMP_MS / 1000:
+            break
+        page.wait_for_timeout(500)
 
     attendre_champ_relation_actif(page)
     log("Connexion réussie.")
@@ -1018,6 +1355,7 @@ def traiter_modal_portfolio(page, ligne):
     regler_checkbox(page, "anonymizedDocument", ligne["Anonymized_document"])
     regler_checkbox(page, "bienTrouve", ligne["Client_signature"])
     remplir_file_name_si_necessaire(page, ligne["N_intv"], ligne["StatementType"])
+    appliquer_parametres_avances(page, ligne.get("Avances"))
 
     # Vérification finale juste avant génération
     verifier_et_corriger_parametres_avant_generate(page, ligne)
@@ -1184,9 +1522,24 @@ def cliquer_un_accept(page, restants, output_dir):
     return None
 
 
+def _signaler(progression, *evenement):
+    """Transmet l'avancement à l'interface (optionnel, sans jamais bloquer le robot)."""
+    if progression is None:
+        return
+    try:
+        progression(*evenement)
+    except Exception:
+        pass
+
+
+def _arret_demande(arret):
+    return arret is not None and arret.is_set()
+
+
 def attendre_et_telecharger_fichiers(page, expected_rows, output_dir,
                                      interval_seconds=INTERVALLE_NOTIFS_SEC,
-                                     timeout_minutes=TIMEOUT_NOTIFS_MIN):
+                                     timeout_minutes=TIMEOUT_NOTIFS_MIN,
+                                     progression=None, arret=None):
     fichiers = []
     restants = list(expected_rows)
     nb_attendus = len(expected_rows)
@@ -1197,11 +1550,16 @@ def attendre_et_telecharger_fichiers(page, expected_rows, output_dir,
 
     os.makedirs(output_dir, exist_ok=True)
     log(f"Attente de {nb_attendus} fichier(s) dans les notifications...")
+    _signaler(progression, "telechargement", 0, nb_attendus)
 
     deadline = time.time() + timeout_minutes * 60
     termine = False
 
     while restants and not termine and time.time() < deadline:
+        if _arret_demande(arret):
+            log("Arrêt demandé : attente des fichiers interrompue.")
+            break
+
         try:
             ouvrir_panneau_notifications(page)
 
@@ -1215,6 +1573,7 @@ def attendre_et_telecharger_fichiers(page, expected_rows, output_dir,
                     restants.remove(info["_row"])
                 fichiers.append(info)
                 log(f"Fichier {len(fichiers)} ({info['Verification']}) : {info['Fichier']}")
+                _signaler(progression, "telechargement", min(len(fichiers), nb_attendus), nb_attendus)
 
         except Exception as e:
             log(f"ATTENTION : erreur pendant la vérification des notifications : {e}")
@@ -1224,6 +1583,7 @@ def attendre_et_telecharger_fichiers(page, expected_rows, output_dir,
 
         nb_ok = nb_attendus - len(restants)
         log(f"{nb_ok}/{nb_attendus} fichier(s) vérifié(s), nouvelle vérification dans {interval_seconds}s...")
+        _signaler(progression, "attente", min(len(fichiers), nb_attendus), nb_attendus)
         fermer_panneau_notifications(page)
         page.wait_for_timeout(interval_seconds * 1000)
 
@@ -1239,7 +1599,7 @@ def attendre_et_telecharger_fichiers(page, expected_rows, output_dir,
 # ============================================================
 # Traitement principal
 # ============================================================
-def run(playwright, df, output_dir):
+def run(playwright, df, output_dir, progression=None, arret=None):
     browser = playwright.chromium.launch(
         executable_path=CHROME_PATH,
         headless=False
@@ -1257,13 +1617,19 @@ def run(playwright, df, output_dir):
     nb_generes = 0
 
     try:
+        _signaler(progression, "connexion")
         connexion(page)
 
         rows_to_process = lire_lignes_depuis_df(df)
         log(f"{len(rows_to_process)} valeur(s) N_intv à traiter")
 
         for idx, ligne in enumerate(rows_to_process, start=1):
+            if _arret_demande(arret):
+                log(f"Arrêt demandé : {len(rows_to_process) - idx + 1} N_intv non traité(s).")
+                break
+
             n_intv = ligne["N_intv"]
+            _signaler(progression, "soumission", idx, len(rows_to_process), n_intv)
             date_ligne = ligne["Date"]
             statement_type = ligne["StatementType"]
             performance_type = ligne["PerformanceType"]
@@ -1295,6 +1661,7 @@ def run(playwright, df, output_dir):
                 })
             except Exception as e:
                 log(f"ERREUR sur {n_intv} : {e}")
+                _signaler(progression, "echec", idx, len(rows_to_process), n_intv)
                 resultats.append({
                     "N_intv": n_intv,
                     "Date": date_ligne,
@@ -1314,7 +1681,12 @@ def run(playwright, df, output_dir):
                     log(f"ATTENTION : impossible de cliquer Clear all filters : {e}")
 
         log(f"{nb_generes}/{len(rows_to_process)} génération(s) soumise(s) avec succès.")
-        fichiers = attendre_et_telecharger_fichiers(page, rows_generees, output_dir)
+        if _arret_demande(arret):
+            log("Arrêt demandé : les fichiers déjà soumis ne seront pas téléchargés.")
+        else:
+            fichiers = attendre_et_telecharger_fichiers(
+                page, rows_generees, output_dir, progression=progression, arret=arret
+            )
         log("Traitement terminé.")
 
     finally:
@@ -1349,7 +1721,7 @@ _STYLES_BOUTON = {
     ),
     "secondaire": dict(
         fg_color=UI_CARD, hover_color=UI_HOVER_LIGHT, text_color=UI_TEXT,
-        text_color_disabled="#A0A7B4", border_width=1, border_color=UI_BORDER,
+        text_color_disabled="#A0A7B4", border_width=1, border_color="#CFD6E1",
     ),
     "danger": dict(
         fg_color=UI_CARD, hover_color=UI_DANGER_HOVER, text_color=RED,
@@ -1382,11 +1754,27 @@ class _Bouton(ctk.CTkButton):
         super().configure(require_redraw=require_redraw, **kwargs)
 
 
+def _accorder(n, aucun, singulier, pluriel):
+    """Choisit le texte selon n (0, 1 ou plusieurs). {n} est remplacé par le nombre."""
+    if n == 0:
+        texte = aucun
+    elif n == 1:
+        texte = singulier
+    else:
+        texte = pluriel
+    return texte.format(n=n)
+
+
 def _police(size=13, weight="normal"):
     return ctk.CTkFont(family=UI_FONT, size=size, weight=weight)
 
 
-def _carte(parent, titre=None, droite=None):
+def _etoile_obligatoire(parent, taille):
+    """Petite étoile rouge des champs obligatoires, comme dans Cockpit."""
+    return ctk.CTkLabel(parent, text="*", font=_police(taille, "bold"), text_color=RED, width=0)
+
+
+def _carte(parent, titre=None, droite=None, obligatoire=False):
     """Carte blanche arrondie avec titre optionnel. Retourne (carte, entête, corps)."""
     carte = ctk.CTkFrame(parent, fg_color=UI_CARD, corner_radius=12, border_width=1, border_color=UI_BORDER)
     entete = None
@@ -1394,13 +1782,20 @@ def _carte(parent, titre=None, droite=None):
         entete = ctk.CTkFrame(carte, fg_color="transparent")
         entete.pack(fill="x", padx=18, pady=(14, 0))
         ctk.CTkLabel(entete, text=titre, font=_police(14, "bold"), text_color=UI_TEXT).pack(side="left")
+        if obligatoire:
+            _etoile_obligatoire(entete, 14).pack(side="left", padx=(4, 0))
     corps = ctk.CTkFrame(carte, fg_color="transparent")
     corps.pack(fill="both", expand=True, padx=18, pady=(10, 16))
     return carte, entete, corps
 
 
-def _libelle_champ(parent, texte):
-    return ctk.CTkLabel(parent, text=texte, font=_police(12, "bold"), text_color=UI_MUTED, anchor="w")
+def _libelle_champ(parent, texte, obligatoire=False):
+    if not obligatoire:
+        return ctk.CTkLabel(parent, text=texte, font=_police(12, "bold"), text_color=UI_MUTED, anchor="w")
+    ligne = ctk.CTkFrame(parent, fg_color="transparent")
+    ctk.CTkLabel(ligne, text=texte, font=_police(12, "bold"), text_color=UI_MUTED, anchor="w").pack(side="left")
+    _etoile_obligatoire(ligne, 12).pack(side="left", padx=(3, 0))
+    return ligne
 
 
 def _liste_deroulante(parent, variable, values, **kwargs):
@@ -1450,7 +1845,12 @@ def popup_fin_generation_choix(parent, nb_generes):
 
     ctk.CTkLabel(
         frame,
-        text=f"Les {nb_generes} reporting(s) ont été générés.",
+        text=_accorder(
+            nb_generes,
+            "Aucun reporting n'a été généré.",
+            "Le reporting a été généré.",
+            "Les {n} reportings ont été générés.",
+        ),
         font=_police(13),
         text_color=UI_MUTED,
         anchor="w"
@@ -1484,6 +1884,522 @@ def popup_fin_generation_choix(parent, nb_generes):
 
 
 # ============================================================
+# Modale de saisie des identifiants Cockpit
+# ============================================================
+def _icone_oeil(barre=False, couleur=UI_MUTED, fond=UI_FIELD, taille=20):
+    """Icône œil (ou œil barré) dessinée avec Pillow, nette quel que soit l'écran."""
+    from PIL import Image, ImageDraw
+
+    f = 6
+    s = taille * f
+    img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    epaisseur = max(f, int(s * 0.085))
+
+    d.ellipse((int(s * 0.06), int(s * 0.24), int(s * 0.94), int(s * 0.76)), outline=couleur, width=epaisseur)
+    r = int(s * 0.13)
+    d.ellipse((s // 2 - r, s // 2 - r, s // 2 + r, s // 2 + r), fill=couleur)
+
+    if barre:
+        d.line((int(s * 0.16), int(s * 0.86), int(s * 0.84), int(s * 0.14)), fill=fond, width=epaisseur * 3)
+        d.line((int(s * 0.16), int(s * 0.86), int(s * 0.84), int(s * 0.14)), fill=couleur, width=epaisseur)
+
+    img = img.resize((taille * 2, taille * 2), Image.LANCZOS)
+    return ctk.CTkImage(light_image=img, size=(taille, taille))
+
+
+def _capturer_fenetre(root):
+    """
+    Image du contenu de la fenêtre. Sous Windows, capture la fenêtre elle-même
+    (PrintWindow) : le résultat est juste même si une autre application est
+    devant ou si la fenêtre vient d'apparaître. Sinon, capture de l'écran.
+    """
+    from PIL import Image, ImageGrab
+
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32, gdi32 = ctypes.windll.user32, ctypes.windll.gdi32
+            P = ctypes.c_void_p
+            user32.GetParent.restype = P
+            user32.GetParent.argtypes = [P]
+            user32.GetClientRect.argtypes = [P, ctypes.POINTER(wintypes.RECT)]
+            user32.GetDC.restype = P
+            user32.GetDC.argtypes = [P]
+            user32.ReleaseDC.argtypes = [P, P]
+            user32.PrintWindow.argtypes = [P, P, wintypes.UINT]
+            gdi32.CreateCompatibleDC.restype = P
+            gdi32.CreateCompatibleDC.argtypes = [P]
+            gdi32.CreateCompatibleBitmap.restype = P
+            gdi32.CreateCompatibleBitmap.argtypes = [P, ctypes.c_int, ctypes.c_int]
+            gdi32.SelectObject.restype = P
+            gdi32.SelectObject.argtypes = [P, P]
+            gdi32.DeleteObject.argtypes = [P]
+            gdi32.DeleteDC.argtypes = [P]
+
+            class BITMAPINFOHEADER(ctypes.Structure):
+                _fields_ = [
+                    ("biSize", wintypes.DWORD), ("biWidth", wintypes.LONG), ("biHeight", wintypes.LONG),
+                    ("biPlanes", wintypes.WORD), ("biBitCount", wintypes.WORD), ("biCompression", wintypes.DWORD),
+                    ("biSizeImage", wintypes.DWORD), ("biXPelsPerMeter", wintypes.LONG),
+                    ("biYPelsPerMeter", wintypes.LONG), ("biClrUsed", wintypes.DWORD),
+                    ("biClrImportant", wintypes.DWORD),
+                ]
+
+            gdi32.GetDIBits.argtypes = [P, P, wintypes.UINT, wintypes.UINT, P, ctypes.POINTER(BITMAPINFOHEADER), wintypes.UINT]
+
+            hwnd = user32.GetParent(root.winfo_id()) or root.winfo_id()
+            rect = wintypes.RECT()
+            user32.GetClientRect(hwnd, ctypes.byref(rect))
+            largeur, hauteur = rect.right - rect.left, rect.bottom - rect.top
+
+            hdc_fenetre = user32.GetDC(hwnd)
+            hdc = gdi32.CreateCompatibleDC(hdc_fenetre)
+            bitmap = gdi32.CreateCompatibleBitmap(hdc_fenetre, largeur, hauteur)
+            ancien = gdi32.SelectObject(hdc, bitmap)
+            try:
+                PW_CLIENTONLY_RENDERFULLCONTENT = 0x1 | 0x2
+                if not user32.PrintWindow(hwnd, hdc, PW_CLIENTONLY_RENDERFULLCONTENT):
+                    raise OSError("PrintWindow a échoué")
+                gdi32.SelectObject(hdc, ancien)  # le bitmap doit être libre pour GetDIBits
+
+                entete = BITMAPINFOHEADER()
+                entete.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+                entete.biWidth, entete.biHeight = largeur, -hauteur  # négatif : de haut en bas
+                entete.biPlanes, entete.biBitCount, entete.biCompression = 1, 32, 0
+                tampon = ctypes.create_string_buffer(largeur * hauteur * 4)
+                if not gdi32.GetDIBits(hdc, bitmap, 0, hauteur, tampon, ctypes.byref(entete), 0):
+                    raise OSError("GetDIBits a échoué")
+                image = Image.frombuffer("RGB", (largeur, hauteur), tampon, "raw", "BGRX", 0, 1).copy()
+            finally:
+                gdi32.SelectObject(hdc, ancien)
+                gdi32.DeleteObject(bitmap)
+                gdi32.DeleteDC(hdc)
+                user32.ReleaseDC(hwnd, hdc_fenetre)
+
+            if image.convert("L").getextrema()[1] > 20:  # image entièrement noire = capture ratée
+                return image
+            log("Capture de la fenêtre vide, capture d'écran utilisée.")
+        except Exception as e:
+            log(f"Capture de la fenêtre impossible ({e}), capture d'écran utilisée.")
+
+    x, y = root.winfo_rootx(), root.winfo_rooty()
+    return ImageGrab.grab(
+        bbox=(x, y, x + max(root.winfo_width(), 1), y + max(root.winfo_height(), 1)), all_screens=True
+    ).convert("RGB")
+
+
+def _ouvrir_fond_flou(root):
+    """Recouvre la fenêtre d'une capture d'elle-même floutée. Retourne l'état du fond."""
+    root.update_idletasks()
+    root.update()
+
+    largeur = max(root.winfo_width(), 1)
+    hauteur = max(root.winfo_height(), 1)
+    try:
+        echelle = ctk.ScalingTracker.get_widget_scaling(root)
+    except Exception:
+        echelle = 1.0
+
+    image_fond = None
+    capture_fond = None
+    couleur_coins = UI_BG
+    try:
+        from PIL import Image, ImageFilter
+
+        capture = _capturer_fenetre(root)
+        capture = capture.filter(ImageFilter.GaussianBlur(radius=12))
+        capture = Image.blend(capture, Image.new("RGB", capture.size, "#0F1B33"), 0.30)
+
+        cx, cy = capture.size[0] // 2, capture.size[1] // 2
+        r, g, b = capture.crop((cx - 260, cy - 200, cx + 260, cy + 200)).resize((1, 1)).getpixel((0, 0))
+        couleur_coins = f"#{r:02x}{g:02x}{b:02x}"
+
+        capture_fond = capture
+        image_fond = ctk.CTkImage(light_image=capture, size=(largeur / echelle, hauteur / echelle))
+    except Exception as e:
+        log(f"Flou d'arrière-plan indisponible ({e}), fond uni utilisé.")
+        couleur_coins = "#8C95A6"
+
+    calque = ctk.CTkLabel(root, text="", image=image_fond, fg_color=couleur_coins, corner_radius=0)
+    calque.place(x=0, y=0, relwidth=1, relheight=1)
+    calque.lift()
+
+    # Pas de resizable(False, False) : sous Windows, changer cet attribut recrée
+    # le cadre de la fenêtre et la fait clignoter. Si la fenêtre est
+    # redimensionnée, le fond flouté est simplement réétiré à la nouvelle taille.
+    def ajuster_fond(event):
+        if event.widget is not root or capture_fond is None:
+            return
+        try:
+            calque.configure(image=ctk.CTkImage(
+                light_image=capture_fond,
+                size=(max(event.width, 1) / echelle, max(event.height, 1) / echelle)
+            ))
+        except Exception:
+            pass
+
+    id_ajuster_fond = root.bind("<Configure>", ajuster_fond, add="+")
+    return {"calque": calque, "couleur": couleur_coins, "id_configure": id_ajuster_fond}
+
+
+def _attendre_modale(root, fond, carte, termine, resultat, obligatoire, focus=None):
+    """Bloque le reste de la fenêtre jusqu'à termine.set(True), puis retire la modale et le flou."""
+    # La carte n'est posée qu'une fois entièrement construite, d'abord cachée sous
+    # le fond flouté le temps de sa mise en page, puis affichée d'un coup : sinon
+    # on la voit se construire par étapes (clignotement).
+    carte.place(relx=0.5, rely=0.5, anchor="center")
+    try:
+        carte.lower(fond["calque"])
+        for _ in range(3):
+            root.update_idletasks()
+            root.update()
+    except Exception:
+        pass
+    carte.lift()
+
+    ancien_protocole = root.protocol("WM_DELETE_WINDOW")
+
+    def fermeture_fenetre():
+        if obligatoire:
+            resultat["quitter"] = True
+        termine.set(True)
+
+    root.protocol("WM_DELETE_WINDOW", fermeture_fenetre)
+
+    try:
+        carte.grab_set()
+    except Exception:
+        pass
+    if focus is not None:
+        focus.focus_set()
+
+    root.wait_variable(termine)
+
+    try:
+        carte.grab_release()
+    except Exception:
+        pass
+    carte.destroy()
+    fond["calque"].destroy()
+    try:
+        root.unbind("<Configure>", fond["id_configure"])
+    except Exception:
+        pass
+    root.protocol("WM_DELETE_WINDOW", ancien_protocole or root.destroy)
+
+
+def modale_identifiants(root, username_initial="", message=None, obligatoire=False, enregistrer=None):
+    """
+    Affiche une carte de connexion par-dessus la fenêtre principale floutée.
+    - obligatoire=True : pas de bouton Annuler, fermer la fenêtre quitte le robot.
+    - enregistrer(username, password) : appelé à la validation ; une exception
+      s'affiche dans la carte et la modale reste ouverte.
+    Retourne (username, password) ou None si annulé.
+    """
+    resultat = {"valeur": None, "quitter": False}
+    termine = tk.BooleanVar(master=root, value=False)
+
+    fond = _ouvrir_fond_flou(root)
+    couleur_coins = fond["couleur"]
+
+    # ---- Carte de connexion ------------------------------------
+    carte = ctk.CTkFrame(
+        root, fg_color=UI_CARD, bg_color=couleur_coins, corner_radius=12,
+        border_width=1, border_color=UI_BORDER
+    )
+    # placée à l'écran par _attendre_modale, une fois entièrement construite
+
+    contenu = ctk.CTkFrame(carte, fg_color="transparent")
+    contenu.pack(padx=44, pady=(36, 34))
+
+    ctk.CTkLabel(contenu, text="Connexion à Cockpit", font=_police(24, "bold"), text_color=UI_TEXT).pack()
+
+    ctk.CTkLabel(
+        contenu,
+        text="Tes identifiants sont enregistrés chiffrés sur ce poste.\nTu pourras les modifier à tout moment.",
+        font=_police(12),
+        text_color=UI_MUTED,
+        justify="center",
+    ).pack(pady=(6, 24))
+
+    if message:
+        ctk.CTkLabel(
+            contenu,
+            text=message,
+            font=_police(12, "bold"),
+            text_color=RED,
+            fg_color="#FDECEA",
+            corner_radius=8,
+            wraplength=380,
+            justify="left",
+        ).pack(fill="x", pady=(0, 16), ipadx=10, ipady=8)
+
+    style_champ = dict(
+        width=400, height=46, corner_radius=8, border_width=1, border_color="#CBD3DF",
+        fg_color=UI_CARD, text_color=UI_TEXT, placeholder_text_color="#8A93A3", font=_police(14),
+    )
+
+    e_user = ctk.CTkEntry(contenu, placeholder_text="Username", **style_champ)
+    e_user.pack(pady=(0, 14))
+    if username_initial:
+        e_user.insert(0, username_initial)
+
+    e_pwd = ctk.CTkEntry(contenu, placeholder_text="Password", show="•", **style_champ)
+    e_pwd.pack()
+
+    icones = {
+        "voir": _icone_oeil(barre=False, couleur=UI_TEXT, fond=UI_CARD),
+        "masquer": _icone_oeil(barre=True, couleur=UI_TEXT, fond=UI_CARD),
+    }
+    etat_mdp = {"visible": False}
+
+    def basculer_visibilite():
+        etat_mdp["visible"] = not etat_mdp["visible"]
+        e_pwd.configure(show="" if etat_mdp["visible"] else "•")
+        btn_oeil.configure(image=icones["masquer" if etat_mdp["visible"] else "voir"])
+        e_pwd.focus_set()
+
+    btn_oeil = ctk.CTkButton(
+        contenu, text="", image=icones["voir"], width=34, height=34, corner_radius=6,
+        fg_color=UI_CARD, hover_color=UI_HOVER_LIGHT, command=basculer_visibilite, cursor="hand2"
+    )
+    btn_oeil.place(in_=e_pwd, relx=1.0, x=-6, rely=0.5, anchor="e")
+
+    lbl_erreur = ctk.CTkLabel(contenu, text="", font=_police(12), text_color=RED, wraplength=400, justify="left")
+    lbl_erreur.pack(fill="x", pady=(8, 0))
+
+    boutons = ctk.CTkFrame(contenu, fg_color="transparent")
+    boutons.pack(fill="x", pady=(10, 0))
+
+    def valider(*_):
+        username = e_user.get().strip()
+        password = e_pwd.get()
+        if not username or not password:
+            lbl_erreur.configure(text="Merci de renseigner l'identifiant et le mot de passe.")
+            return
+        if enregistrer is not None:
+            try:
+                enregistrer(username, password)
+            except Exception as e:
+                lbl_erreur.configure(text=f"Enregistrement impossible : {e}")
+                return
+        resultat["valeur"] = (username, password)
+        termine.set(True)
+
+    def annuler(*_):
+        if obligatoire:
+            return
+        termine.set(True)
+
+    _Bouton(
+        boutons, "primaire", text="Enregistrer", command=valider,
+        width=130, height=42, font=_police(14, "bold")
+    ).pack(side="right")
+
+    if not obligatoire:
+        _Bouton(boutons, "secondaire", text="Annuler", command=annuler, width=110, height=42).pack(side="right", padx=(0, 10))
+
+    for champ in (e_user, e_pwd):
+        champ.bind("<Return>", valider)
+        champ.bind("<Escape>", annuler)
+        champ.bind("<Key>", lambda event: lbl_erreur.configure(text="") if event.keysym != "Return" else None)
+
+    _attendre_modale(root, fond, carte, termine, resultat, obligatoire,
+                     focus=(e_pwd if username_initial else e_user))
+
+    if resultat["quitter"]:
+        root.destroy()
+        return None
+
+    return resultat["valeur"]
+
+
+def _case(parent, texte, variable):
+    return ctk.CTkCheckBox(
+        parent, text=texte, variable=variable, onvalue=True, offvalue=False,
+        font=_police(13), text_color=UI_TEXT, fg_color=UI_PRIMARY, hover_color=UI_PRIMARY_HOVER,
+        border_color="#AEB8C7", border_width=2, checkmark_color=WHITE,
+        corner_radius=4, checkbox_width=18, checkbox_height=18,
+    )
+
+
+def _zone_commentaire(parent, libelle, valeur_initiale):
+    """Zone de texte avec compteur « n/600 » comme dans Cockpit. Retourne une fonction de lecture."""
+    cadre = ctk.CTkFrame(parent, fg_color="transparent")
+    entete = ctk.CTkFrame(cadre, fg_color="transparent")
+    entete.pack(fill="x")
+    ctk.CTkLabel(entete, text=libelle, font=_police(12, "bold"), text_color=UI_MUTED).pack(side="left")
+    compteur = ctk.CTkLabel(entete, text="", font=_police(12), text_color=UI_MUTED)
+    compteur.pack(side="left", padx=(8, 0))
+
+    zone = ctk.CTkTextbox(
+        cadre, height=70, font=_police(13), fg_color=UI_FIELD, text_color=UI_TEXT,
+        border_width=1, border_color=UI_BORDER, corner_radius=8, wrap="word",
+    )
+    zone.pack(fill="x", pady=(4, 0))
+    zone.insert("1.0", valeur_initiale)
+
+    def lire():
+        return zone.get("1.0", "end-1c")
+
+    def actualiser(_event=None):
+        texte = lire()
+        if len(texte) > LONGUEUR_MAX_COMMENTAIRE:
+            zone.delete(f"1.0+{LONGUEUR_MAX_COMMENTAIRE}c", "end")
+            texte = lire()
+        compteur.configure(text=f"{len(texte)}/{LONGUEUR_MAX_COMMENTAIRE}")
+
+    zone.bind("<KeyRelease>", actualiser)
+    zone.bind("<<Paste>>", lambda e: zone.after(10, actualiser))
+    actualiser()
+    return cadre, lire
+
+
+def modale_parametres_avances(root, valeurs):
+    """
+    Fenêtre « Advanced parameters » sur fond flouté (mêmes blocs que Cockpit sous OPTIONS).
+    Retourne le dictionnaire validé (actif=True), les valeurs Cockpit (actif=False)
+    si l'utilisateur les rétablit, ou None s'il annule.
+    """
+    valeurs = normaliser_avances(valeurs)
+    resultat = {"valeur": None, "quitter": False}
+    termine = tk.BooleanVar(master=root, value=False)
+
+    fond = _ouvrir_fond_flou(root)
+
+    carte = ctk.CTkFrame(
+        root, fg_color=UI_CARD, bg_color=fond["couleur"], corner_radius=12,
+        border_width=1, border_color=UI_BORDER
+    )
+    # placée à l'écran par _attendre_modale, une fois entièrement construite
+
+    entete = ctk.CTkFrame(carte, fg_color="transparent")
+    entete.pack(fill="x", padx=30, pady=(26, 4))
+    ctk.CTkLabel(entete, text="Advanced parameters", font=_police(22, "bold"), text_color=UI_TEXT).pack(anchor="w")
+
+    # Hauteur de la zone défilante : adaptée à la fenêtre (portables)
+    try:
+        echelle = ctk.ScalingTracker.get_widget_scaling(root)
+    except Exception:
+        echelle = 1.0
+    hauteur_zone = max(220, min(560, int(root.winfo_height() / echelle) - 260))
+
+    corps = ctk.CTkScrollableFrame(
+        carte, width=700, height=hauteur_zone, fg_color="transparent",
+        scrollbar_button_color="#CBD3DF", scrollbar_button_hover_color="#AEB8C7",
+    )
+    corps.pack(fill="both", expand=True, padx=(22, 14), pady=(10, 0))
+    corps.grid_columnconfigure((0, 1), weight=1, uniform="avances")
+
+    variables = {}
+    lecteurs = {}
+    ligne = {"n": 0}
+
+    def titre_section(texte, sous_titre=False):
+        ctk.CTkLabel(
+            corps, text=texte, text_color=UI_TEXT if not sous_titre else UI_MUTED,
+            font=_police(14 if not sous_titre else 12, "bold"),
+        ).grid(row=ligne["n"], column=0, columnspan=2, sticky="w", padx=8,
+               pady=((18 if ligne["n"] else 4) if not sous_titre else 2, 8))
+        ligne["n"] += 1
+
+    # -- POSITIONS PARAMETERS
+    titre_section("POSITIONS PARAMETERS")
+    seg_positions = ctk.CTkSegmentedButton(
+        corps, values=POSITIONS_CHOIX, height=36, corner_radius=8, font=_police(13, "bold"),
+        fg_color=UI_FIELD, unselected_color=UI_FIELD, unselected_hover_color=UI_FIELD_HOVER,
+        selected_color=UI_PRIMARY, selected_hover_color=UI_PRIMARY_HOVER, text_color=UI_TEXT,
+    )
+
+    def couleurs_positions(choix):
+        for nom, bouton in seg_positions._buttons_dict.items():
+            bouton.configure(text_color=WHITE if nom == choix else UI_TEXT)
+
+    seg_positions.configure(command=couleurs_positions)
+    seg_positions.set(valeurs["accountDetails"])
+    couleurs_positions(valeurs["accountDetails"])
+    seg_positions.grid(row=ligne["n"], column=0, sticky="w", padx=8, pady=(0, 10))
+    ligne["n"] += 1
+
+    def case(fcn, texte, colonne=0, retrait=0, nouvelle_ligne=True):
+        variables[fcn] = tk.BooleanVar(master=root, value=valeurs[fcn])
+        _case(corps, texte, variables[fcn]).grid(
+            row=ligne["n"], column=colonne, sticky="w", padx=(8 + 28 * retrait, 8), pady=5
+        )
+        if nouvelle_ligne:
+            ligne["n"] += 1
+
+    def commentaire(fcn, texte, retrait=0):
+        cadre, lecteurs[fcn] = _zone_commentaire(corps, texte, valeurs[fcn])
+        cadre.grid(row=ligne["n"], column=0, columnspan=2, sticky="ew", padx=(8 + 28 * retrait, 8), pady=(6, 8))
+        ligne["n"] += 1
+
+    case("taxData", "Tax data for French residents")
+
+    # -- OPTIONAL PAGES (2 colonnes, comme Cockpit)
+    titre_section("OPTIONAL PAGES")
+    case("tableOfContent", "Table of content", colonne=0, nouvelle_ligne=False)
+    case("indexEvolution", "Index evolution", colonne=1)
+    case("lifeInsuranceReporting", "Life insurance reporting", colonne=0, nouvelle_ligne=False)
+    case("historyMovements", "History of movements", colonne=1)
+
+    # -- CONSOLIDATION
+    titre_section("CONSOLIDATION")
+    titre_section("CONSOLIDATED VIEW PAGES", sous_titre=True)
+    case("assetSummary", "Summary of Assets & Key Information")
+    case("openingDate", "Opening date", retrait=1)
+    case("capGainLoss", "Capital Gains or Losses & Accrued Interests", retrait=1)
+    case("commitments", "Synthesis of commitments", retrait=1)
+    commentaire("keyInformationComment", "Key Information", retrait=1)
+    case("breakdownByCurrency", "Breakdown of net asset by currency")
+    case("focusSharesBonds", "Focus Shares & Bonds")
+    case("incomeSchedule", "Income Schedule")
+
+    # -- COMMENTS
+    titre_section("COMMENTS")
+    case("coverPage", "Cover page")
+    commentaire("coverPageComment", "Cover page comment", retrait=1)
+
+    # ---- Boutons ------------------------------------------------
+    ctk.CTkFrame(carte, fg_color=UI_BORDER, height=1, corner_radius=0).pack(fill="x", pady=(10, 0))
+    boutons = ctk.CTkFrame(carte, fg_color="transparent")
+    boutons.pack(fill="x", padx=30, pady=16)
+
+    def lire_formulaire(actif):
+        lu = {"actif": actif, "accountDetails": seg_positions.get() or valeurs["accountDetails"]}
+        lu.update({fcn: bool(var.get()) for fcn, var in variables.items()})
+        lu.update({fcn: lire() for fcn, lire in lecteurs.items()})
+        return normaliser_avances(lu)
+
+    def valider(*_):
+        resultat["valeur"] = lire_formulaire(actif=True)
+        termine.set(True)
+
+    def retablir():
+        resultat["valeur"] = normaliser_avances({"actif": False})
+        termine.set(True)
+
+    def annuler(*_):
+        termine.set(True)
+
+    _Bouton(
+        boutons, "fantome", text="Default parameters", command=retablir
+    ).pack(side="left")
+    _Bouton(
+        boutons, "primaire", text="Valider", command=valider,
+        width=130, height=42, font=_police(14, "bold")
+    ).pack(side="right")
+    _Bouton(boutons, "secondaire", text="Annuler", command=annuler, width=110, height=42).pack(side="right", padx=(0, 10))
+
+    carte.bind("<Escape>", annuler)
+    _attendre_modale(root, fond, carte, termine, resultat, obligatoire=False, focus=carte)
+    return resultat["valeur"]
+
+
+# ============================================================
 # Interface CustomTkinter - 1 seule étape + presets
 # ============================================================
 def ouvrir_interface():
@@ -1494,14 +2410,19 @@ def ouvrir_interface():
     data_validee = False
     df_courant = pd.DataFrame(columns=GUI_COLUMNS)
 
+    # Thème clair uniquement : on désactive la recoloration de la barre de titre
+    # Windows, qui masque/réaffiche la fenêtre (clignotement) sans rien apporter ici.
+    ctk.CTk._deactivate_windows_window_header_manipulation = True
+    ctk.CTkToplevel._deactivate_windows_window_header_manipulation = True
+
     ctk.set_appearance_mode("light")
     ctk.set_default_color_theme("blue")
 
     root = ctk.CTk()
     root.title("Cockpit - Paramètres de génération")
     root.configure(fg_color=UI_BG)
-    root.geometry("1160x1020")
-    root.minsize(1080, 900)
+    root.geometry("1160x820")
+    root.minsize(900, 560)
 
     def _maximiser():
         try:
@@ -1557,13 +2478,94 @@ def ouvrir_interface():
     lbl_processing = None
     progress_bar = None
     txt_n_intv = None
-    info_var = tk.StringVar(value="0 Numéro(s) d'intervenant détecté(s)")
+    info_var = tk.StringVar(value="Aucun numéro d'intervenant détecté")
     lbl_intro = None
     lbl_output_state = None
     seg_statement = None
 
     dernier_etat_reference = {"value": None}
     preset_precedent = {"value": ""}
+    suivi = {"en_cours": False, "arret": None, "echecs": 0, "fermer_apres": False}
+    etat_avances = {"valeur": normaliser_avances({})}
+    btn_avances = None
+
+    def rafraichir_resume_avances():
+        # Bouton en bleu quand des paramètres avancés sont appliqués, neutre sinon
+        if btn_avances is None:
+            return
+        actif = etat_avances["valeur"].get("actif")
+        btn_avances.configure(
+            text_color=UI_PRIMARY if actif else UI_TEXT,
+            border_color=UI_PRIMARY if actif else "#CFD6E1",
+        )
+
+    def ouvrir_parametres_avances():
+        resultat = modale_parametres_avances(root, etat_avances["valeur"])
+        if resultat is None:
+            return
+        if resultat != etat_avances["valeur"]:
+            etat_avances["valeur"] = resultat
+            rafraichir_resume_avances()
+            mark_dirty()
+
+    def valeur_liste(var):
+        """Valeur à envoyer au robot : "" si l'option « Vide » est choisie."""
+        valeur = var.get().strip()
+        return "" if valeur == OPTION_VIDE else valeur
+
+    def afficher_liste(valeur):
+        """Valeur à afficher dans une liste facultative : « Vide » si elle est vide."""
+        valeur = str(valeur if valeur is not None else "").strip()
+        return valeur if valeur else OPTION_VIDE
+
+    def _ajouter_croix_vider(menu, var):
+        """Petite croix × dans la liste pour la vider, visible tant qu'une valeur est choisie."""
+        croix = ctk.CTkButton(
+            menu, text="×", width=24, height=24, corner_radius=12,
+            fg_color=UI_FIELD, bg_color=UI_FIELD, hover_color=UI_FIELD_HOVER,
+            text_color=UI_MUTED, font=_police(17), cursor="hand2",
+            command=lambda: var.set(OPTION_VIDE),
+        )
+
+        def actualiser(*_):
+            if var.get().strip() in ("", OPTION_VIDE):
+                croix.place_forget()
+            else:
+                croix.place(relx=1.0, x=-34, rely=0.5, anchor="e")
+
+        var.trace_add("write", actualiser)
+        actualiser()
+
+    def ajuster_a_l_ecran():
+        """Réduit l'échelle de l'interface si elle ne tient pas en hauteur à l'écran
+        (portables avec mise à l'échelle Windows à 125 % / 150 %)."""
+        try:
+            root.update_idletasks()
+            echelle_dpi = ctk.ScalingTracker.get_window_scaling(root)
+
+            hauteur_ecran = None
+            if os.name == "nt":
+                import ctypes
+                from ctypes import wintypes
+                zone = wintypes.RECT()
+                if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(zone), 0):  # SPI_GETWORKAREA
+                    hauteur_ecran = zone.bottom - zone.top
+            if not hauteur_ecran:
+                hauteur_ecran = root.winfo_screenheight() - int(48 * echelle_dpi)
+
+            hauteur_dispo = hauteur_ecran - int(40 * echelle_dpi)  # barre de titre
+            hauteur_requise = root.winfo_reqheight()
+
+            if 0 < hauteur_dispo < hauteur_requise:
+                # pas sous l'échelle 100 % effective : en dessous, CustomTkinter
+                # n'affiche plus les bordures fines des boutons
+                facteur = max(0.75, 1 / echelle_dpi, hauteur_dispo / hauteur_requise)
+                if facteur >= 1:
+                    return
+                ctk.set_widget_scaling(ctk.ScalingTracker.widget_scaling * facteur)
+                log(f"Interface réduite à {facteur:.0%} pour tenir à l'écran.")
+        except Exception as e:
+            log(f"Ajustement à l'écran impossible ({e}).")
 
     def get_liste_n_intv():
         contenu = txt_n_intv.get("1.0", "end")
@@ -1591,11 +2593,19 @@ def ouvrir_interface():
 
     def mettre_a_jour_compteur(*_):
         liste = get_liste_n_intv()
-        info_var.set(f"{len(liste)} Numéro(s) d'intervenant détecté(s)")
+        info_var.set(_accorder(
+            len(liste),
+            "Aucun numéro d'intervenant détecté",
+            "1 numéro d'intervenant détecté",
+            "{n} numéros d'intervenant détectés",
+        ))
         if lbl_intro is not None:
-            lbl_intro.configure(
-                text=f"{len(liste)} Numéro(s) d'intervenant seront traités. Les paramètres ci-dessous seront appliqués à tous."
-            )
+            lbl_intro.configure(text=_accorder(
+                len(liste),
+                "Aucun numéro d'intervenant à traiter pour l'instant.",
+                "1 numéro d'intervenant sera traité. Les paramètres ci-dessous lui seront appliqués.",
+                "{n} numéros d'intervenant seront traités. Les paramètres ci-dessous seront appliqués à tous.",
+            ))
 
     def normalize_preset_payload(payload):
         n_intv = payload.get("n_intv", [])
@@ -1626,6 +2636,7 @@ def ouvrir_interface():
                 "monthly_perf_history": str(p.get("monthly_perf_history", DEFAULT_GUI_VALUES["Monthly_perf_history"])).strip(),
                 "annual_perf_history": str(p.get("annual_perf_history", DEFAULT_GUI_VALUES["Annual_perf_history"])).strip(),
                 "output_path": str(p.get("output_path", "")).strip(),
+                "avances": normaliser_avances(p.get("avances")),
             }
         }
 
@@ -1639,9 +2650,10 @@ def ouvrir_interface():
                 "anonymized": bool(var_anonymized.get()),
                 "signature": bool(var_signature.get()),
                 "performance_type": var_perf.get().strip(),
-                "monthly_perf_history": var_monthly.get().strip(),
-                "annual_perf_history": var_annual.get().strip(),
+                "monthly_perf_history": valeur_liste(var_monthly),
+                "annual_perf_history": valeur_liste(var_annual),
                 "output_path": var_output_dir.get().strip(),
+                "avances": dict(etat_avances["valeur"]),
             }
         }
         return normalize_preset_payload(payload)
@@ -1686,8 +2698,13 @@ def ouvrir_interface():
             bouton.configure(text_color=WHITE if nom == selected_statement["value"] else UI_TEXT)
 
     def update_delete_button():
-        etat = "normal" if var_preset.get().strip() else "disabled"
-        btn_delete_preset.configure(state=etat)
+        # Visible uniquement quand un paramétrage est sélectionné dans la liste
+        if var_preset.get().strip():
+            btn_delete_preset.configure(state="normal")
+            if not btn_delete_preset.winfo_manager():
+                btn_delete_preset.pack(side="right", padx=(0, 8), after=btn_reset)
+        else:
+            btn_delete_preset.pack_forget()
 
     def refresh_preset_combo(select=""):
         presets = get_presets_pour_utilisateur(config, ut_code)
@@ -1752,11 +2769,12 @@ def ouvrir_interface():
             df_local.at[idx, "Performance_type"] = var_perf.get().strip()
             df_local.at[idx, "Est_currency"] = var_currency.get().strip()
             df_local.at[idx, "Language"] = var_lang.get().strip()
-            df_local.at[idx, "Monthly_perf_history"] = var_monthly.get().strip()
-            df_local.at[idx, "Annual_perf_history"] = var_annual.get().strip()
+            df_local.at[idx, "Monthly_perf_history"] = valeur_liste(var_monthly)
+            df_local.at[idx, "Annual_perf_history"] = valeur_liste(var_annual)
             df_local.at[idx, "Anonymized_document"] = bool(var_anonymized.get())
             df_local.at[idx, "Client_signature"] = bool(var_signature.get())
 
+        df_local["Parametres_avances"] = json.dumps(etat_avances["valeur"], ensure_ascii=False)
         return df_local
 
     def appliquer_preset_sur_formulaire(preset):
@@ -1775,8 +2793,11 @@ def ouvrir_interface():
         var_anonymized.set(bool(params.get("anonymized", DEFAULT_GUI_VALUES["Anonymized_document"])))
         var_signature.set(bool(params.get("signature", DEFAULT_GUI_VALUES["Client_signature"])))
         var_perf.set(str(params.get("performance_type", DEFAULT_GUI_VALUES["Performance_type"])).strip() or DEFAULT_GUI_VALUES["Performance_type"])
-        var_monthly.set(str(params.get("monthly_perf_history", DEFAULT_GUI_VALUES["Monthly_perf_history"])).strip() or DEFAULT_GUI_VALUES["Monthly_perf_history"])
-        var_annual.set(str(params.get("annual_perf_history", DEFAULT_GUI_VALUES["Annual_perf_history"])).strip() or DEFAULT_GUI_VALUES["Annual_perf_history"])
+        # Champs facultatifs : une valeur vide enregistrée reste vide
+        var_monthly.set(afficher_liste(params.get("monthly_perf_history", DEFAULT_GUI_VALUES["Monthly_perf_history"])))
+        var_annual.set(afficher_liste(params.get("annual_perf_history", DEFAULT_GUI_VALUES["Annual_perf_history"])))
+        etat_avances["valeur"] = normaliser_avances(params.get("avances"))
+        rafraichir_resume_avances()
 
         output_path_preset = str(params.get("output_path", "")).strip()
         if output_path_preset:
@@ -1841,7 +2862,12 @@ def ouvrir_interface():
 
         if afficher_message_succes:
             lbl_status.configure(
-                text=f"✓ Data validée ({len(df_courant)} numéro(s) d'intervenant) | UT : {ut_code}",
+                text=_accorder(
+                    len(df_courant),
+                    "✓ Data validée (aucun numéro d'intervenant)",
+                    "✓ Data validée (1 numéro d'intervenant)",
+                    "✓ Data validée ({n} numéros d'intervenant)",
+                ) + f" | UT : {ut_code}",
                 text_color=GREEN
             )
 
@@ -1860,24 +2886,90 @@ def ouvrir_interface():
         btn_delete_preset.configure(state="disabled")
         btn_reset.configure(state="disabled")
         cb_preset.configure(state="disabled")
+        btn_identifiants.configure(state="disabled")
+        btn_avances.configure(state="disabled")
 
     def reactiver_boutons_apres_traitement():
         btn_valider.configure(state="normal")
         btn_generate.configure(state="normal" if data_validee else "disabled")
         btn_last_params.configure(state="normal")
         btn_save_preset.configure(state="normal")
+        btn_reset.configure(state="normal")
         cb_preset.configure(state="normal")
+        btn_identifiants.configure(state="normal")
+        btn_avances.configure(state="normal")
         update_delete_button()
 
+    def _barre_indeterminee(active):
+        if active and progress_bar.cget("mode") != "indeterminate":
+            progress_bar.configure(mode="indeterminate")
+            progress_bar.start()
+        elif not active and progress_bar.cget("mode") != "determinate":
+            progress_bar.stop()
+            progress_bar.configure(mode="determinate")
+
     def afficher_traitement():
-        lbl_processing.configure(text="Traitement en cours...")
-        progress_bar.pack(side="left", padx=(0, 10))
-        progress_bar.start()
+        lbl_status.configure(text="")
+        lbl_echecs.configure(text="")
+        lbl_compteur.configure(text="")
+        lbl_processing.configure(text="Lancement du navigateur…")
+        _barre_indeterminee(True)
+        suivi_frame.pack(side="left")
+        btn_arreter.configure(state="normal", text="Arrêter")
+        btn_arreter.pack(side="left", padx=(0, 12), before=btn_valider)
 
     def masquer_traitement():
-        progress_bar.stop()
-        progress_bar.pack_forget()
+        _barre_indeterminee(False)
+        progress_bar.set(0)
+        suivi_frame.pack_forget()
+        btn_arreter.pack_forget()
         lbl_processing.configure(text="")
+
+    def afficher_progression(evenement, *infos):
+        """Met à jour le suivi à partir des événements envoyés par run()."""
+        if evenement == "connexion":
+            lbl_processing.configure(text="Connexion à Cockpit…")
+            _barre_indeterminee(True)
+
+        elif evenement == "soumission":
+            idx, total, n_intv = infos
+            _barre_indeterminee(False)
+            lbl_processing.configure(text=f"Génération · N° {n_intv}")
+            lbl_compteur.configure(text=f"{idx}/{total}")
+            progress_bar.set((idx - 1) / total)
+
+        elif evenement == "echec":
+            suivi["echecs"] += 1
+            lbl_echecs.configure(text=_accorder(suivi["echecs"], "", "✗ 1 échec", "✗ {n} échecs"))
+
+        elif evenement in ("telechargement", "attente"):
+            faits, total = infos
+            _barre_indeterminee(False)
+            if evenement == "attente":
+                lbl_processing.configure(text="Téléchargement · en attente de Cockpit…")
+            else:
+                lbl_processing.configure(text="Téléchargement des reportings")
+            lbl_compteur.configure(text=f"{faits}/{total}")
+            progress_bar.set(faits / total if total else 1)
+
+    def arreter_traitement():
+        if suivi["arret"] is None:
+            return
+        suivi["arret"].set()
+        btn_arreter.configure(state="disabled", text="Arrêt…")
+        lbl_processing.configure(text="Arrêt en cours, fin de l'étape en cours…")
+        log("Arrêt demandé par l'utilisateur.")
+
+    def fermeture_pendant_traitement():
+        if not suivi["en_cours"]:
+            root.destroy()
+            return
+        if messagebox.askyesno(
+            "Traitement en cours",
+            "Une génération est en cours.\nL'arrêter et fermer le robot ?"
+        ):
+            suivi["fermer_apres"] = True
+            arreter_traitement()
 
     def coller_presse_papier():
         try:
@@ -2002,6 +3094,8 @@ def ouvrir_interface():
         var_annual.set(DEFAULT_GUI_VALUES["Annual_perf_history"])
         var_anonymized.set(DEFAULT_GUI_VALUES["Anonymized_document"])
         var_signature.set(DEFAULT_GUI_VALUES["Client_signature"])
+        etat_avances["valeur"] = normaliser_avances({})
+        rafraichir_resume_avances()
 
         try:
             date_entry.set_date(datetime.today())
@@ -2019,6 +3113,48 @@ def ouvrir_interface():
         set_reference_state()
 
         lbl_status.configure(text="✓ Formulaire réinitialisé", text_color=GREEN)
+
+    def demander_identifiants_ui(message=None, obligatoire=False):
+        username_enregistre, _ = charger_identifiants_pour_utilisateur(config, ut_code)
+
+        def enregistrer(username, password):
+            sauvegarder_identifiants_pour_utilisateur(config, ut_code, username, password)
+            sauvegarder_config(config)
+
+        resultat = modale_identifiants(
+            root,
+            username_initial=username_enregistre or USERNAME,
+            message=message,
+            obligatoire=obligatoire,
+            enregistrer=enregistrer,
+        )
+        if resultat is None:
+            return False
+
+        appliquer_identifiants(*resultat)
+        if lbl_status.winfo_exists():
+            lbl_status.configure(text="✓ Identifiants Cockpit enregistrés", text_color=GREEN)
+        log(f"Identifiants Cockpit enregistrés pour {ut_code}")
+        return True
+
+    def verifier_identifiants_au_demarrage():
+        username, password = charger_identifiants_pour_utilisateur(config, ut_code)
+        if username and password:
+            appliquer_identifiants(username, password)
+            return
+
+        # Fenêtre au premier plan et entièrement dessinée avant le flou
+        try:
+            root.lift()
+            root.focus_force()
+            root.update()
+        except Exception:
+            pass
+
+        message = None
+        if username:
+            message = "Le mot de passe enregistré n'est pas lisible sur ce poste. Merci de le ressaisir."
+        demander_identifiants_ui(message=message, obligatoire=True)
 
     def generer():
         nonlocal df_courant
@@ -2046,30 +3182,93 @@ def ouvrir_interface():
 
         desactiver_boutons_traitement()
         afficher_traitement()
-        root.update_idletasks()
-        root.update()
 
-        try:
-            with sync_playwright() as playwright:
-                nb = run(playwright, df_courant, chemin_output)
+        # Le robot Playwright tourne dans un fil séparé : l'interface reste
+        # réactive et reçoit l'avancement via une file de messages.
+        messages = queue.Queue()
+        arret = threading.Event()
+        suivi.update(en_cours=True, arret=arret, echecs=0, fermer_apres=False)
+        df_a_traiter = df_courant
 
-            masquer_traitement()
+        def travail_robot():
+            try:
+                with sync_playwright() as playwright:
+                    nb = run(
+                        playwright, df_a_traiter, chemin_output,
+                        progression=lambda *evenement: messages.put(("progression", evenement)),
+                        arret=arret,
+                    )
+                messages.put(("fin", nb))
+            except EchecConnexionCockpit:
+                messages.put(("echec_connexion", None))
+            except Exception as e:
+                messages.put(("erreur", e))
 
-            fermer_robot = popup_fin_generation_choix(root, nb)
-
-            if fermer_robot:
-                root.destroy()
-            else:
-                reactiver_boutons_apres_traitement()
-                lbl_status.configure(
-                    text=f"✓ Dernière génération terminée ({nb} reporting(s))",
-                    text_color=GREEN
-                )
-
-        except Exception as e:
+        def fin_traitement():
+            suivi.update(en_cours=False, arret=None)
             masquer_traitement()
             reactiver_boutons_apres_traitement()
-            messagebox.showerror("Erreur", f"Erreur pendant le traitement : {e}")
+
+        def lire_messages():
+            try:
+                while True:
+                    type_message, contenu = messages.get_nowait()
+
+                    if type_message == "progression":
+                        afficher_progression(*contenu)
+                        continue
+
+                    arret_demande = arret.is_set()
+                    fin_traitement()
+
+                    if suivi["fermer_apres"]:
+                        root.destroy()
+                        return
+
+                    if type_message == "fin":
+                        nb = contenu
+                        if arret_demande:
+                            lbl_status.configure(
+                                text=_accorder(
+                                    nb,
+                                    "⏹ Traitement arrêté (aucun reporting soumis)",
+                                    "⏹ Traitement arrêté (1 reporting soumis)",
+                                    "⏹ Traitement arrêté ({n} reportings soumis)",
+                                ),
+                                text_color=UI_MUTED
+                            )
+                        elif popup_fin_generation_choix(root, nb):
+                            root.destroy()
+                        else:
+                            lbl_status.configure(
+                                text=_accorder(
+                                    nb,
+                                    "✓ Dernière génération terminée (aucun reporting)",
+                                    "✓ Dernière génération terminée (1 reporting)",
+                                    "✓ Dernière génération terminée ({n} reportings)",
+                                ),
+                                text_color=GREEN
+                            )
+
+                    elif type_message == "echec_connexion":
+                        log("Connexion refusée par Cockpit : demande de nouveaux identifiants.")
+                        if demander_identifiants_ui(
+                            message="Cockpit a refusé tes identifiants (mot de passe expiré ?). "
+                                    "Mets-les à jour : la génération sera relancée automatiquement."
+                        ):
+                            generer()
+
+                    elif type_message == "erreur":
+                        messagebox.showerror("Erreur", f"Erreur pendant le traitement : {contenu}")
+
+                    return
+            except queue.Empty:
+                pass
+
+            root.after(150, lire_messages)
+
+        threading.Thread(target=travail_robot, name="robot_cockpit", daemon=True).start()
+        root.after(150, lire_messages)
 
     for v in [var_perf, var_currency, var_lang, var_monthly, var_annual]:
         v.trace_add("write", mark_dirty)
@@ -2109,7 +3308,21 @@ def ouvrir_interface():
         fg_color="#1B4FA6",
         corner_radius=14,
         height=28,
-    ).grid(row=0, column=1, sticky="e", padx=28, ipadx=10)
+    ).grid(row=0, column=1, sticky="e", padx=(28, 10), ipadx=10)
+
+    btn_identifiants = ctk.CTkButton(
+        header,
+        text="Modifier les identifiants",
+        command=lambda: demander_identifiants_ui(),
+        font=_police(12, "bold"),
+        text_color=WHITE,
+        fg_color="#1B4FA6",
+        hover_color="#2A5FBA",
+        corner_radius=14,
+        height=28,
+        cursor="hand2",
+    )
+    btn_identifiants.grid(row=0, column=2, sticky="e", padx=(0, 28))
 
     # ---- Barre des paramétrages ------------------------------
     preset_row = ctk.CTkFrame(root, fg_color=UI_CARD, corner_radius=12, border_width=1, border_color=UI_BORDER)
@@ -2134,8 +3347,8 @@ def ouvrir_interface():
     btn_reset = _Bouton(preset_inner, "fantome", text="Réinitialiser", command=reset_formulaire, width=110)
     btn_reset.pack(side="right")
 
-    btn_delete_preset = _Bouton(preset_inner, "danger", text="Supprimer", command=supprimer_preset, state="disabled", width=100)
-    btn_delete_preset.pack(side="right", padx=(0, 8))
+    btn_delete_preset = _Bouton(preset_inner, "danger", text="Supprimer le paramétrage", command=supprimer_preset)
+    # affiché par update_delete_button() dès qu'un paramétrage est choisi
 
     # ---- Corps : 2 colonnes ----------------------------------
     body = ctk.CTkFrame(root, fg_color="transparent")
@@ -2150,7 +3363,7 @@ def ouvrir_interface():
     gauche.grid_rowconfigure(0, weight=1)
 
     # Colonne gauche : liste des numéros d'intervenant
-    zone_frame, zone_entete, zone_corps = _carte(gauche, "Numéros d'intervenant")
+    zone_frame, zone_entete, zone_corps = _carte(gauche, "Numéros d'intervenant", obligatoire=True)
     zone_frame.grid(row=0, column=0, sticky="nsew", pady=(0, 14))
 
     ctk.CTkLabel(
@@ -2165,7 +3378,7 @@ def ouvrir_interface():
 
     lbl_intro = ctk.CTkLabel(
         zone_corps,
-        text="0 Numéro(s) d'intervenant seront traités. Les paramètres ci-dessous seront appliqués à tous.",
+        text="Aucun numéro d'intervenant à traiter pour l'instant.",
         font=_police(12),
         text_color=UI_MUTED,
         anchor="w",
@@ -2194,6 +3407,7 @@ def ouvrir_interface():
         border_color=UI_BORDER,
         corner_radius=8,
         wrap="word",
+        height=110,  # hauteur minimale : la zone s'agrandit avec la fenêtre
     )
     txt_n_intv.pack(fill="both", expand=True)
     txt_n_intv.bind("<KeyRelease>", on_n_intv_change)
@@ -2205,7 +3419,7 @@ def ouvrir_interface():
     droite.grid_rowconfigure(1, weight=1)
 
     # Statement type
-    stmt_frame, _, stmt_corps = _carte(droite, "Statement Type *")
+    stmt_frame, _, stmt_corps = _carte(droite, "Statement Type", obligatoire=True)
     stmt_frame.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 14))
 
     seg_statement = ctk.CTkSegmentedButton(
@@ -2225,11 +3439,11 @@ def ouvrir_interface():
     seg_statement.pack(fill="x")
 
     # Paramètres globaux
-    left, _, left_corps = _carte(droite, "Paramètres globaux")
+    left, _, left_corps = _carte(droite, "GLOBAL STATEMENT PARAMETERS")
     left.grid(row=1, column=0, sticky="nsew", padx=(0, 7))
     left_corps.grid_columnconfigure(0, weight=1)
 
-    _libelle_champ(left_corps, "Date").grid(row=0, column=0, sticky="w", pady=(0, 4))
+    _libelle_champ(left_corps, "VALUATION DATE", obligatoire=True).grid(row=0, column=0, sticky="w", pady=(0, 4))
     date_frame = ctk.CTkFrame(left_corps, fg_color="transparent")
     date_frame.grid(row=1, column=0, sticky="we", pady=(0, 12))
 
@@ -2258,10 +3472,10 @@ def ouvrir_interface():
 
     _Bouton(date_frame, "secondaire", text="Aujourd'hui", command=set_today, width=100).pack(side="left", padx=(8, 0))
 
-    _libelle_champ(left_corps, "Estimation currency").grid(row=2, column=0, sticky="w", pady=(0, 4))
+    _libelle_champ(left_corps, "Estimation currency", obligatoire=True).grid(row=2, column=0, sticky="w", pady=(0, 4))
     _liste_deroulante(left_corps, var_currency, LISTE_EST_CURRENCY).grid(row=3, column=0, sticky="we", pady=(0, 12))
 
-    _libelle_champ(left_corps, "Language").grid(row=4, column=0, sticky="w", pady=(0, 4))
+    _libelle_champ(left_corps, "Language", obligatoire=True).grid(row=4, column=0, sticky="w", pady=(0, 4))
     _liste_deroulante(left_corps, var_lang, LISTE_LANGUAGE).grid(row=5, column=0, sticky="we", pady=(0, 16))
 
     for i, (texte, var) in enumerate([("Anonymized document", var_anonymized), ("Client Signature", var_signature)]):
@@ -2281,19 +3495,27 @@ def ouvrir_interface():
             switch_height=20,
         ).grid(row=6 + i, column=0, sticky="w", pady=(0, 10))
 
+    btn_avances = _Bouton(left_corps, "secondaire", text="Advanced parameters", command=ouvrir_parametres_avances)
+    btn_avances.grid(row=8, column=0, sticky="w", pady=(8, 0))
+    rafraichir_resume_avances()
+
     # Options
-    right, _, right_corps = _carte(droite, "Options")
+    right, _, right_corps = _carte(droite, "OPTIONS")
     right.grid(row=1, column=1, sticky="nsew", padx=(7, 0))
     right_corps.grid_columnconfigure(0, weight=1)
 
-    _libelle_champ(right_corps, "Performance type").grid(row=0, column=0, sticky="w", pady=(0, 4))
+    _libelle_champ(right_corps, "Performance Type", obligatoire=True).grid(row=0, column=0, sticky="w", pady=(0, 4))
     _liste_deroulante(right_corps, var_perf, LISTE_PERFORMANCE_TYPE).grid(row=1, column=0, sticky="we", pady=(0, 12))
 
-    _libelle_champ(right_corps, "Monthly perf history").grid(row=2, column=0, sticky="w", pady=(0, 4))
-    _liste_deroulante(right_corps, var_monthly, LISTE_MONTHLY).grid(row=3, column=0, sticky="we", pady=(0, 12))
+    _libelle_champ(right_corps, "Monthly performance history").grid(row=2, column=0, sticky="w", pady=(0, 4))
+    menu_monthly = _liste_deroulante(right_corps, var_monthly, [OPTION_VIDE] + LISTE_MONTHLY)
+    menu_monthly.grid(row=3, column=0, sticky="we", pady=(0, 12))
+    _ajouter_croix_vider(menu_monthly, var_monthly)
 
-    _libelle_champ(right_corps, "Annual perf history").grid(row=4, column=0, sticky="w", pady=(0, 4))
-    _liste_deroulante(right_corps, var_annual, LISTE_ANNUAL).grid(row=5, column=0, sticky="we", pady=(0, 12))
+    _libelle_champ(right_corps, "Annual performance history").grid(row=4, column=0, sticky="w", pady=(0, 4))
+    menu_annual = _liste_deroulante(right_corps, var_annual, [OPTION_VIDE] + LISTE_ANNUAL)
+    menu_annual.grid(row=5, column=0, sticky="we", pady=(0, 12))
+    _ajouter_croix_vider(menu_annual, var_annual)
 
     ctk.CTkLabel(
         right_corps,
@@ -2306,7 +3528,7 @@ def ouvrir_interface():
     ).grid(row=6, column=0, sticky="w", pady=(4, 0))
 
     # Répertoire output
-    output_frame, output_top, output_corps = _carte(gauche, "Répertoire output")
+    output_frame, output_top, output_corps = _carte(gauche, "Répertoire output", obligatoire=True)
     output_frame.grid(row=1, column=0, sticky="ew")
 
     _Bouton(output_top, "secondaire", text="Choisir un répertoire", command=choisir_output_dir).pack(side="right")
@@ -2345,25 +3567,44 @@ def ouvrir_interface():
     lbl_status = ctk.CTkLabel(status_frame, text="", text_color=GREEN, font=_police(13, "bold"))
     lbl_status.pack(side="left", padx=(0, 20))
 
+    # Suivi du traitement (affiché uniquement pendant une génération)
+    suivi_frame = ctk.CTkFrame(status_frame, fg_color="transparent")
+
+    lbl_processing = ctk.CTkLabel(
+        suivi_frame,
+        text="",
+        text_color=UI_TEXT,
+        font=_police(13),
+        anchor="w",
+        width=330,
+    )
+    lbl_processing.pack(side="left", padx=(0, 12))
+
     progress_bar = ctk.CTkProgressBar(
-        status_frame,
-        mode="indeterminate",
-        width=180,
-        height=6,
+        suivi_frame,
+        mode="determinate",
+        width=220,
+        height=8,
+        corner_radius=4,
         progress_color=UI_PRIMARY,
         fg_color=UI_FIELD_HOVER,
     )
+    progress_bar.set(0)
+    progress_bar.pack(side="left", padx=(0, 12))
 
-    lbl_processing = ctk.CTkLabel(
-        status_frame,
-        text="",
-        text_color=UI_MUTED,
-        font=ctk.CTkFont(family=UI_FONT, size=13, slant="italic")
-    )
-    lbl_processing.pack(side="left")
+    lbl_compteur = ctk.CTkLabel(suivi_frame, text="", text_color=UI_TEXT, font=_police(13, "bold"))
+    lbl_compteur.pack(side="left", padx=(0, 12))
+
+    lbl_echecs = ctk.CTkLabel(suivi_frame, text="", text_color=RED, font=_police(12, "bold"))
+    lbl_echecs.pack(side="left")
 
     actions = ctk.CTkFrame(bottom, fg_color="transparent")
     actions.grid(row=1, column=1, sticky="e", padx=28)
+
+    btn_arreter = _Bouton(
+        actions, "danger", text="Arrêter", command=arreter_traitement,
+        width=110, height=42, font=_police(14, "bold")
+    )
 
     btn_valider = _Bouton(
         actions, "secondaire", text="VALIDER", command=valider,
@@ -2382,6 +3623,9 @@ def ouvrir_interface():
     rafraichir_info_output()
     refresh_preset_combo(select="")
     set_reference_state()
+    root.protocol("WM_DELETE_WINDOW", fermeture_pendant_traitement)
+    ajuster_a_l_ecran()
+    root.after(300, verifier_identifiants_au_demarrage)
     root.mainloop()
 
 

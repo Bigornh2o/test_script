@@ -1,0 +1,66 @@
+Structure de la fenêtre « Portfolio Statement Parameters »
+
+  [champ] *   formcontrolname=reportType | pms-button-switch-multi
+  [bouton] STANDARD  (actif)   classes: btn-switch btn-switch-md ng-star-inserted button-selected
+  [bouton] FULL   classes: btn-switch btn-switch-md ng-star-inserted
+  [bouton] LIGHT   classes: btn-switch btn-switch-md ng-star-inserted
+  [champ] (sans libellé)   formcontrolname=- | input/text | valeur=<0 caractères>
+
+=== GLOBAL STATEMENT PARAMETERS ===
+  [champ] *   formcontrolname=valuationDate | input/text | valeur=04.11.2026
+  [bouton] calendar_today   classes: btn btn-outline-secondary ml-2
+
+=== DAY-1 ===
+  [champ] *   formcontrolname=estimationCurrency | ng-select | valeur='EUR' | croix ×
+          options : CHF, ALL, ZAR, DZD, DEM, SAR, ARS, AUD, ATS, BSD, AED, SYP, BHD, BDT, KHR, BEF, BMD, BWP, BRL, CAD, KYD, LKR, CLP, DOP, CNY, CNH, CYP, COP, KPW, KRW, CRC, DKK, EGP, ESP, USD, ETB, FIM, INR, TWD, FRF, XPF, XOF, XAF, GBP, GRD, XCD, KGS, LAK, GNF, LVL, HKD, HUF, MXN, IDR, IEP, ISK, NAD, ILS, ITL, JPY, JOD, KES, KWD, LBP, LRD, LUF, MOP, MYR, MTL, MAD, OMR, MUR, NPR, NGN, NOK, VUV, NZD, PKR, PAB, PGK, ... (121 options au total)
+  [champ] *   formcontrolname=language | ng-select | valeur='FRENCH' | croix ×
+          options : lecture impossible : Locator.scroll_into_view_if_needed: Element is not attached to the DOM
+Call log:
+  - attempting scroll into view action
+    - waiting for element to be stable
+    - element is not stable
+  - retrying scroll into view action
+    - waiting for element to be stable
+
+  [champ] Anonymized document   formcontrolname=anonymizedDocument | input/checkbox | non coché
+  [champ] Client Signature   formcontrolname=bienTrouve | input/checkbox | non coché
+
+=== OPTIONS ===
+  [champ] *   formcontrolname=performanceType | ng-select | valeur='MWR' | croix ×
+          options : lecture impossible : Locator.scroll_into_view_if_needed: Timeout 30000ms exceeded.
+Call log:
+  - waiting for locator("[formcontrolname=\"performanceType\"]").first
+
+  [champ] Monthly performance history   formcontrolname=monthlyPerformanceFrom | ng-select | valeur='2025-08' | croix ×
+          options : 2026-10, 2026-09, 2026-08, 2026-07, 2026-06, 2026-05, 2026-04, 2026-03, 2026-02, 2026-01, 2025-12, 2025-11, 2025-10, 2025-09, 2025-08
+  [champ] Annual performance history   formcontrolname=annualPerformanceFrom | ng-select | valeur='×' | croix ×
+          options : 
+  [champ] 37/60   formcontrolname=description | textarea | valeur=<37 caractères> | max 60
+
+=== POSITIONS PARAMETERS ===
+  [champ] Tax data for French residents   formcontrolname=accountDetails | pms-button-switch-multi
+  [bouton] NO POSITIONS   classes: btn-switch btn-switch-md ng-star-inserted
+  [bouton] WITH POSITIONS  (actif)   classes: btn-switch btn-switch-md ng-star-inserted button-selected
+  [champ] Tax data for French residents   formcontrolname=taxData | input/checkbox | coché
+
+=== OPTIONAL PAGES ===
+  [champ] Table of content   formcontrolname=tableOfContent | input/checkbox | coché
+  [champ] Life insurance reporting   formcontrolname=lifeInsuranceReporting | input/checkbox | coché
+  [champ] Index evolution   formcontrolname=indexEvolution | input/checkbox | non coché
+  [champ] History of movements   formcontrolname=historyMovements | input/checkbox | coché
+
+=== CONSOLIDATION ===
+
+=== CONSOLIDATED VIEW PAGES ===
+  [champ] Summary of Assets & Key Information   formcontrolname=assetSummary | input/checkbox | coché
+  [champ] Opening date   formcontrolname=openingDate | input/checkbox | coché
+  [champ] Capital Gains or Losses & Accrued Interests   formcontrolname=capGainLoss | input/checkbox | coché
+  [champ] Synthesis of commitments   formcontrolname=commitments | input/checkbox | coché
+  [champ] 1/600   formcontrolname=keyInformationComment | textarea | valeur=<1 caractères> | max 600
+  [champ] Breakdown of net asset by currency   formcontrolname=breakdownByCurrency | input/checkbox | non coché
+  [champ] Focus Shares & Bonds   formcontrolname=focusSharesBonds | input/checkbox | coché
+  [champ] Income Schedule   formcontrolname=incomeSchedule | input/checkbox | coché
+
+=== COMMENTS ===
+  [champ] Cover page   formcontrolname=coverPage | input/checkbox | coché
+  [champ] 0/600   formcontrolname=coverPageComment | textarea | valeur=<0 caractères> | max 600
