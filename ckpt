@@ -1587,7 +1587,12 @@ def _police(size=13, weight="normal"):
     return ctk.CTkFont(family=UI_FONT, size=size, weight=weight)
 
 
-def _carte(parent, titre=None, droite=None):
+def _etoile_obligatoire(parent, taille):
+    """Petite étoile rouge des champs obligatoires, comme dans Cockpit."""
+    return ctk.CTkLabel(parent, text="*", font=_police(taille, "bold"), text_color=RED, width=0)
+
+
+def _carte(parent, titre=None, droite=None, obligatoire=False):
     """Carte blanche arrondie avec titre optionnel. Retourne (carte, entête, corps)."""
     carte = ctk.CTkFrame(parent, fg_color=UI_CARD, corner_radius=12, border_width=1, border_color=UI_BORDER)
     entete = None
@@ -1595,13 +1600,20 @@ def _carte(parent, titre=None, droite=None):
         entete = ctk.CTkFrame(carte, fg_color="transparent")
         entete.pack(fill="x", padx=18, pady=(14, 0))
         ctk.CTkLabel(entete, text=titre, font=_police(14, "bold"), text_color=UI_TEXT).pack(side="left")
+        if obligatoire:
+            _etoile_obligatoire(entete, 14).pack(side="left", padx=(4, 0))
     corps = ctk.CTkFrame(carte, fg_color="transparent")
     corps.pack(fill="both", expand=True, padx=18, pady=(10, 16))
     return carte, entete, corps
 
 
-def _libelle_champ(parent, texte):
-    return ctk.CTkLabel(parent, text=texte, font=_police(12, "bold"), text_color=UI_MUTED, anchor="w")
+def _libelle_champ(parent, texte, obligatoire=False):
+    if not obligatoire:
+        return ctk.CTkLabel(parent, text=texte, font=_police(12, "bold"), text_color=UI_MUTED, anchor="w")
+    ligne = ctk.CTkFrame(parent, fg_color="transparent")
+    ctk.CTkLabel(ligne, text=texte, font=_police(12, "bold"), text_color=UI_MUTED, anchor="w").pack(side="left")
+    _etoile_obligatoire(ligne, 12).pack(side="left", padx=(3, 0))
+    return ligne
 
 
 def _liste_deroulante(parent, variable, values, **kwargs):
@@ -2842,7 +2854,7 @@ def ouvrir_interface():
     gauche.grid_rowconfigure(0, weight=1)
 
     # Colonne gauche : liste des numéros d'intervenant
-    zone_frame, zone_entete, zone_corps = _carte(gauche, "Numéros d'intervenant")
+    zone_frame, zone_entete, zone_corps = _carte(gauche, "Numéros d'intervenant", obligatoire=True)
     zone_frame.grid(row=0, column=0, sticky="nsew", pady=(0, 14))
 
     ctk.CTkLabel(
@@ -2898,7 +2910,7 @@ def ouvrir_interface():
     droite.grid_rowconfigure(1, weight=1)
 
     # Statement type
-    stmt_frame, _, stmt_corps = _carte(droite, "Statement Type *")
+    stmt_frame, _, stmt_corps = _carte(droite, "Statement Type", obligatoire=True)
     stmt_frame.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 14))
 
     seg_statement = ctk.CTkSegmentedButton(
@@ -2918,11 +2930,11 @@ def ouvrir_interface():
     seg_statement.pack(fill="x")
 
     # Paramètres globaux
-    left, _, left_corps = _carte(droite, "Paramètres globaux")
+    left, _, left_corps = _carte(droite, "GLOBAL STATEMENT PARAMETERS")
     left.grid(row=1, column=0, sticky="nsew", padx=(0, 7))
     left_corps.grid_columnconfigure(0, weight=1)
 
-    _libelle_champ(left_corps, "Date").grid(row=0, column=0, sticky="w", pady=(0, 4))
+    _libelle_champ(left_corps, "VALUATION DATE", obligatoire=True).grid(row=0, column=0, sticky="w", pady=(0, 4))
     date_frame = ctk.CTkFrame(left_corps, fg_color="transparent")
     date_frame.grid(row=1, column=0, sticky="we", pady=(0, 12))
 
@@ -2951,10 +2963,10 @@ def ouvrir_interface():
 
     _Bouton(date_frame, "secondaire", text="Aujourd'hui", command=set_today, width=100).pack(side="left", padx=(8, 0))
 
-    _libelle_champ(left_corps, "Estimation currency").grid(row=2, column=0, sticky="w", pady=(0, 4))
+    _libelle_champ(left_corps, "Estimation currency", obligatoire=True).grid(row=2, column=0, sticky="w", pady=(0, 4))
     _liste_deroulante(left_corps, var_currency, LISTE_EST_CURRENCY).grid(row=3, column=0, sticky="we", pady=(0, 12))
 
-    _libelle_champ(left_corps, "Language").grid(row=4, column=0, sticky="w", pady=(0, 4))
+    _libelle_champ(left_corps, "Language", obligatoire=True).grid(row=4, column=0, sticky="w", pady=(0, 4))
     _liste_deroulante(left_corps, var_lang, LISTE_LANGUAGE).grid(row=5, column=0, sticky="we", pady=(0, 16))
 
     for i, (texte, var) in enumerate([("Anonymized document", var_anonymized), ("Client Signature", var_signature)]):
@@ -2975,19 +2987,19 @@ def ouvrir_interface():
         ).grid(row=6 + i, column=0, sticky="w", pady=(0, 10))
 
     # Options
-    right, _, right_corps = _carte(droite, "Options")
+    right, _, right_corps = _carte(droite, "OPTIONS")
     right.grid(row=1, column=1, sticky="nsew", padx=(7, 0))
     right_corps.grid_columnconfigure(0, weight=1)
 
-    _libelle_champ(right_corps, "Performance type").grid(row=0, column=0, sticky="w", pady=(0, 4))
+    _libelle_champ(right_corps, "Performance Type", obligatoire=True).grid(row=0, column=0, sticky="w", pady=(0, 4))
     _liste_deroulante(right_corps, var_perf, LISTE_PERFORMANCE_TYPE).grid(row=1, column=0, sticky="we", pady=(0, 12))
 
-    _libelle_champ(right_corps, "Monthly perf history").grid(row=2, column=0, sticky="w", pady=(0, 4))
+    _libelle_champ(right_corps, "Monthly performance history").grid(row=2, column=0, sticky="w", pady=(0, 4))
     menu_monthly = _liste_deroulante(right_corps, var_monthly, [OPTION_VIDE] + LISTE_MONTHLY)
     menu_monthly.grid(row=3, column=0, sticky="we", pady=(0, 12))
     _ajouter_croix_vider(menu_monthly, var_monthly)
 
-    _libelle_champ(right_corps, "Annual perf history").grid(row=4, column=0, sticky="w", pady=(0, 4))
+    _libelle_champ(right_corps, "Annual performance history").grid(row=4, column=0, sticky="w", pady=(0, 4))
     menu_annual = _liste_deroulante(right_corps, var_annual, [OPTION_VIDE] + LISTE_ANNUAL)
     menu_annual.grid(row=5, column=0, sticky="we", pady=(0, 12))
     _ajouter_croix_vider(menu_annual, var_annual)
@@ -3003,7 +3015,7 @@ def ouvrir_interface():
     ).grid(row=6, column=0, sticky="w", pady=(4, 0))
 
     # Répertoire output
-    output_frame, output_top, output_corps = _carte(gauche, "Répertoire output")
+    output_frame, output_top, output_corps = _carte(gauche, "Répertoire output", obligatoire=True)
     output_frame.grid(row=1, column=0, sticky="ew")
 
     _Bouton(output_top, "secondaire", text="Choisir un répertoire", command=choisir_output_dir).pack(side="right")
