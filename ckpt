@@ -2011,7 +2011,7 @@ def _ouvrir_fond_flou(root):
 
         capture = _capturer_fenetre(root)
         capture = capture.filter(ImageFilter.GaussianBlur(radius=12))
-        capture = Image.blend(capture, Image.new("RGB", capture.size, "#0F1B33"), 0.30)
+        capture = Image.blend(capture, Image.new("RGB", capture.size, "#EEF1F5"), 0.60)  # voile blanc grisé
 
         cx, cy = capture.size[0] // 2, capture.size[1] // 2
         r, g, b = capture.crop((cx - 260, cy - 200, cx + 260, cy + 200)).resize((1, 1)).getpixel((0, 0))
@@ -2021,7 +2021,7 @@ def _ouvrir_fond_flou(root):
         image_fond = ctk.CTkImage(light_image=capture, size=(largeur / echelle, hauteur / echelle))
     except Exception as e:
         log(f"Flou d'arrière-plan indisponible ({e}), fond uni utilisé.")
-        couleur_coins = "#8C95A6"
+        couleur_coins = "#E2E6EC"
 
     calque = ctk.CTkLabel(root, text="", image=image_fond, fg_color=couleur_coins, corner_radius=0)
     calque.place(x=0, y=0, relwidth=1, relheight=1)
@@ -2108,7 +2108,7 @@ def modale_identifiants(root, username_initial="", message=None, obligatoire=Fal
     # ---- Carte de connexion ------------------------------------
     carte = ctk.CTkFrame(
         root, fg_color=UI_CARD, bg_color=couleur_coins, corner_radius=12,
-        border_width=1, border_color=UI_BORDER
+        border_width=1, border_color="#CFD6E1"
     )
     # placée à l'écran par _attendre_modale, une fois entièrement construite
 
@@ -2272,7 +2272,7 @@ def modale_parametres_avances(root, valeurs):
 
     carte = ctk.CTkFrame(
         root, fg_color=UI_CARD, bg_color=fond["couleur"], corner_radius=12,
-        border_width=1, border_color=UI_BORDER
+        border_width=1, border_color="#CFD6E1"
     )
     # placée à l'écran par _attendre_modale, une fois entièrement construite
 
@@ -2449,7 +2449,7 @@ def ouvrir_interface():
         darkcolor=UI_FIELD,
         arrowcolor=UI_MUTED,
         arrowsize=14,
-        padding=(10, 5),
+        padding=(4, 0),
         relief="flat",
     )
     style.map("Cockpit.DateEntry", fieldbackground=[("readonly", UI_FIELD)])
@@ -2536,6 +2536,14 @@ def ouvrir_interface():
         var.trace_add("write", actualiser)
         actualiser()
 
+    def police_date():
+        """Police du champ date en pixels, comme les widgets CustomTkinter (taille 13, mise à l'échelle)."""
+        try:
+            echelle = ctk.ScalingTracker.get_widget_scaling(root)
+        except Exception:
+            echelle = 1.0
+        return (UI_FONT, -int(round(13 * echelle)))
+
     def ajuster_a_l_ecran():
         """Réduit l'échelle de l'interface si elle ne tient pas en hauteur à l'écran
         (portables avec mise à l'échelle Windows à 125 % / 150 %)."""
@@ -2563,6 +2571,7 @@ def ouvrir_interface():
                 if facteur >= 1:
                     return
                 ctk.set_widget_scaling(ctk.ScalingTracker.widget_scaling * facteur)
+                date_entry.configure(font=police_date())
                 log(f"Interface réduite à {facteur:.0%} pour tenir à l'écran.")
         except Exception as e:
             log(f"Ajustement à l'écran impossible ({e}).")
@@ -3447,12 +3456,17 @@ def ouvrir_interface():
     date_frame = ctk.CTkFrame(left_corps, fg_color="transparent")
     date_frame.grid(row=1, column=0, sticky="we", pady=(0, 12))
 
+    # Le calendrier tkcalendar est un widget ttk : on l'insère dans un cadre
+    # CustomTkinter de la même hauteur et du même arrondi que les listes.
+    champ_date = ctk.CTkFrame(date_frame, height=36, fg_color=UI_FIELD, corner_radius=8)
+    champ_date.pack(side="left", fill="x", expand=True)
+
     date_entry = DateEntry(
-        date_frame,
+        champ_date,
         style="Cockpit.DateEntry",
         date_pattern="dd.mm.yyyy",
         width=14,
-        font=(UI_FONT, 11),
+        font=police_date(),
         background=UI_PRIMARY,
         foreground="white",
         headersbackground=UI_HOVER_LIGHT,
@@ -3466,7 +3480,7 @@ def ouvrir_interface():
         bordercolor=UI_BORDER,
         borderwidth=0
     )
-    date_entry.pack(side="left", fill="x", expand=True, ipady=2)
+    date_entry.place(x=4, rely=0.5, relwidth=1.0, width=-8, anchor="w")
     date_entry.set_date(datetime.today())
     date_entry.bind("<<DateEntrySelected>>", mark_dirty)
 
