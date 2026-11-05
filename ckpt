@@ -1965,6 +1965,19 @@ def _ouvrir_fond_flou(root):
 
 def _attendre_modale(root, fond, carte, termine, resultat, obligatoire, focus=None):
     """Bloque le reste de la fenêtre jusqu'à termine.set(True), puis retire la modale et le flou."""
+    # La carte n'est posée qu'une fois entièrement construite, d'abord cachée sous
+    # le fond flouté le temps de sa mise en page, puis affichée d'un coup : sinon
+    # on la voit se construire par étapes (clignotement).
+    carte.place(relx=0.5, rely=0.5, anchor="center")
+    try:
+        carte.lower(fond["calque"])
+        for _ in range(3):
+            root.update_idletasks()
+            root.update()
+    except Exception:
+        pass
+    carte.lift()
+
     ancien_protocole = root.protocol("WM_DELETE_WINDOW")
 
     def fermeture_fenetre():
@@ -2015,8 +2028,7 @@ def modale_identifiants(root, username_initial="", message=None, obligatoire=Fal
         root, fg_color=UI_CARD, bg_color=couleur_coins, corner_radius=12,
         border_width=1, border_color=UI_BORDER
     )
-    carte.place(relx=0.5, rely=0.5, anchor="center")
-    carte.lift()
+    # placée à l'écran par _attendre_modale, une fois entièrement construite
 
     contenu = ctk.CTkFrame(carte, fg_color="transparent")
     contenu.pack(padx=44, pady=(36, 34))
@@ -2180,17 +2192,11 @@ def modale_parametres_avances(root, valeurs):
         root, fg_color=UI_CARD, bg_color=fond["couleur"], corner_radius=12,
         border_width=1, border_color=UI_BORDER
     )
-    carte.place(relx=0.5, rely=0.5, anchor="center")
-    carte.lift()
+    # placée à l'écran par _attendre_modale, une fois entièrement construite
 
     entete = ctk.CTkFrame(carte, fg_color="transparent")
     entete.pack(fill="x", padx=30, pady=(26, 4))
     ctk.CTkLabel(entete, text="Advanced parameters", font=_police(22, "bold"), text_color=UI_TEXT).pack(anchor="w")
-    ctk.CTkLabel(
-        entete,
-        text="Ces paramètres remplacent les valeurs proposées par Cockpit, pour tous les numéros traités.",
-        font=_police(12), text_color=UI_MUTED,
-    ).pack(anchor="w", pady=(4, 0))
 
     # Hauteur de la zone défilante : adaptée à la fenêtre (portables)
     try:
@@ -2298,7 +2304,7 @@ def modale_parametres_avances(root, valeurs):
         termine.set(True)
 
     _Bouton(
-        boutons, "fantome", text="Rétablir les valeurs Cockpit", command=retablir
+        boutons, "fantome", text="Default parameters", command=retablir
     ).pack(side="left")
     _Bouton(
         boutons, "primaire", text="Valider", command=valider,
@@ -2309,18 +2315,6 @@ def modale_parametres_avances(root, valeurs):
     carte.bind("<Escape>", annuler)
     _attendre_modale(root, fond, carte, termine, resultat, obligatoire=False, focus=carte)
     return resultat["valeur"]
-
-
-def resume_parametres_avances(avances):
-    """Texte court affiché sous Client Signature."""
-    avances = normaliser_avances(avances)
-    if not avances["actif"]:
-        return "Valeurs de Cockpit", UI_MUTED
-    nb = sum(1 for k, v in avances.items() if k != "actif" and v != AVANCES_DEFAUT[k])
-    return _accorder(
-        nb, "Personnalisés (identiques aux valeurs de départ)",
-        "Personnalisés · 1 changement", "Personnalisés · {n} changements",
-    ), UI_PRIMARY
 
 
 # ============================================================
@@ -2411,13 +2405,17 @@ def ouvrir_interface():
     preset_precedent = {"value": ""}
     suivi = {"en_cours": False, "arret": None, "echecs": 0, "fermer_apres": False}
     etat_avances = {"valeur": normaliser_avances({})}
-    lbl_avances = None
+    btn_avances = None
 
     def rafraichir_resume_avances():
-        if lbl_avances is None:
+        # Bouton en bleu quand des paramètres avancés sont appliqués, neutre sinon
+        if btn_avances is None:
             return
-        texte, couleur = resume_parametres_avances(etat_avances["valeur"])
-        lbl_avances.configure(text=texte, text_color=couleur)
+        actif = etat_avances["valeur"].get("actif")
+        btn_avances.configure(
+            text_color=UI_PRIMARY if actif else UI_TEXT,
+            border_color=UI_PRIMARY if actif else "#CFD6E1",
+        )
 
     def ouvrir_parametres_avances():
         resultat = modale_parametres_avances(root, etat_avances["valeur"])
@@ -3409,8 +3407,6 @@ def ouvrir_interface():
 
     btn_avances = _Bouton(left_corps, "secondaire", text="Advanced parameters", command=ouvrir_parametres_avances)
     btn_avances.grid(row=8, column=0, sticky="w", pady=(8, 0))
-    lbl_avances = ctk.CTkLabel(left_corps, text="", font=_police(12), text_color=UI_MUTED, anchor="w")
-    lbl_avances.grid(row=9, column=0, sticky="w", pady=(4, 0))
     rafraichir_resume_avances()
 
     # Options
