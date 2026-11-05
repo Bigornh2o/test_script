@@ -1539,7 +1539,7 @@ _STYLES_BOUTON = {
     ),
     "secondaire": dict(
         fg_color=UI_CARD, hover_color=UI_HOVER_LIGHT, text_color=UI_TEXT,
-        text_color_disabled="#A0A7B4", border_width=1, border_color=UI_BORDER,
+        text_color_disabled="#A0A7B4", border_width=1, border_color="#CFD6E1",
     ),
     "danger": dict(
         fg_color=UI_CARD, hover_color=UI_DANGER_HOVER, text_color=RED,
@@ -1938,8 +1938,8 @@ def ouvrir_interface():
     root = ctk.CTk()
     root.title("Cockpit - Paramètres de génération")
     root.configure(fg_color=UI_BG)
-    root.geometry("1160x1020")
-    root.minsize(1080, 900)
+    root.geometry("1160x820")
+    root.minsize(900, 560)
 
     def _maximiser():
         try:
@@ -2013,6 +2013,55 @@ def ouvrir_interface():
         """Valeur à afficher dans une liste facultative : « Vide » si elle est vide."""
         valeur = str(valeur if valeur is not None else "").strip()
         return valeur if valeur else OPTION_VIDE
+
+    def _ajouter_croix_vider(menu, var):
+        """Petite croix × dans la liste pour la vider, visible tant qu'une valeur est choisie."""
+        croix = ctk.CTkButton(
+            menu, text="×", width=24, height=24, corner_radius=12,
+            fg_color=UI_FIELD, bg_color=UI_FIELD, hover_color=UI_FIELD_HOVER,
+            text_color=UI_MUTED, font=_police(17), cursor="hand2",
+            command=lambda: var.set(OPTION_VIDE),
+        )
+
+        def actualiser(*_):
+            if var.get().strip() in ("", OPTION_VIDE):
+                croix.place_forget()
+            else:
+                croix.place(relx=1.0, x=-34, rely=0.5, anchor="e")
+
+        var.trace_add("write", actualiser)
+        actualiser()
+
+    def ajuster_a_l_ecran():
+        """Réduit l'échelle de l'interface si elle ne tient pas en hauteur à l'écran
+        (portables avec mise à l'échelle Windows à 125 % / 150 %)."""
+        try:
+            root.update_idletasks()
+            echelle_dpi = ctk.ScalingTracker.get_window_scaling(root)
+
+            hauteur_ecran = None
+            if os.name == "nt":
+                import ctypes
+                from ctypes import wintypes
+                zone = wintypes.RECT()
+                if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(zone), 0):  # SPI_GETWORKAREA
+                    hauteur_ecran = zone.bottom - zone.top
+            if not hauteur_ecran:
+                hauteur_ecran = root.winfo_screenheight() - int(48 * echelle_dpi)
+
+            hauteur_dispo = hauteur_ecran - int(40 * echelle_dpi)  # barre de titre
+            hauteur_requise = root.winfo_reqheight()
+
+            if 0 < hauteur_dispo < hauteur_requise:
+                # pas sous l'échelle 100 % effective : en dessous, CustomTkinter
+                # n'affiche plus les bordures fines des boutons
+                facteur = max(0.75, 1 / echelle_dpi, hauteur_dispo / hauteur_requise)
+                if facteur >= 1:
+                    return
+                ctk.set_widget_scaling(ctk.ScalingTracker.widget_scaling * facteur)
+                log(f"Interface réduite à {facteur:.0%} pour tenir à l'écran.")
+        except Exception as e:
+            log(f"Ajustement à l'écran impossible ({e}).")
 
     def get_liste_n_intv():
         contenu = txt_n_intv.get("1.0", "end")
@@ -2837,6 +2886,7 @@ def ouvrir_interface():
         border_color=UI_BORDER,
         corner_radius=8,
         wrap="word",
+        height=110,  # hauteur minimale : la zone s'agrandit avec la fenêtre
     )
     txt_n_intv.pack(fill="both", expand=True)
     txt_n_intv.bind("<KeyRelease>", on_n_intv_change)
@@ -2933,10 +2983,14 @@ def ouvrir_interface():
     _liste_deroulante(right_corps, var_perf, LISTE_PERFORMANCE_TYPE).grid(row=1, column=0, sticky="we", pady=(0, 12))
 
     _libelle_champ(right_corps, "Monthly perf history").grid(row=2, column=0, sticky="w", pady=(0, 4))
-    _liste_deroulante(right_corps, var_monthly, [OPTION_VIDE] + LISTE_MONTHLY).grid(row=3, column=0, sticky="we", pady=(0, 12))
+    menu_monthly = _liste_deroulante(right_corps, var_monthly, [OPTION_VIDE] + LISTE_MONTHLY)
+    menu_monthly.grid(row=3, column=0, sticky="we", pady=(0, 12))
+    _ajouter_croix_vider(menu_monthly, var_monthly)
 
     _libelle_champ(right_corps, "Annual perf history").grid(row=4, column=0, sticky="w", pady=(0, 4))
-    _liste_deroulante(right_corps, var_annual, [OPTION_VIDE] + LISTE_ANNUAL).grid(row=5, column=0, sticky="we", pady=(0, 12))
+    menu_annual = _liste_deroulante(right_corps, var_annual, [OPTION_VIDE] + LISTE_ANNUAL)
+    menu_annual.grid(row=5, column=0, sticky="we", pady=(0, 12))
+    _ajouter_croix_vider(menu_annual, var_annual)
 
     ctk.CTkLabel(
         right_corps,
@@ -3045,6 +3099,7 @@ def ouvrir_interface():
     refresh_preset_combo(select="")
     set_reference_state()
     root.protocol("WM_DELETE_WINDOW", fermeture_pendant_traitement)
+    ajuster_a_l_ecran()
     root.after(300, verifier_identifiants_au_demarrage)
     root.mainloop()
 
