@@ -8,9 +8,8 @@ S2i :
     1. Choisis « S2i », tape l'écran (OVAL, IOVT, RRTI...) et clique sur Lancer.
     2. Le robot se connecte tout seul (identifiants lus dans le fichier mdp)
        et ouvre l'écran demandé.
-    3. Dans Chrome, saisis la clé de recherche si l'écran en demande une, puis
-       passe les pages comme d'habitude : chaque nouvelle page est capturée
-       automatiquement dès qu'elle est stable. Le bouton « Capturer » force une
+    3. Dans Chrome, passe les pages s'il y en a plusieurs (ou attends) : chaque
+       nouvelle page est capturée automatiquement dès qu'elle est stable. Le bouton « Capturer » force une
        capture (utile si seules des valeurs ont changé).
     4. Clique sur Terminer : les fichiers sont écrits et Chrome se ferme.
 
@@ -25,7 +24,6 @@ Le robot ne valide rien et ne clique jamais sur un bouton d'action métier.
 Sorties (un dossier par session, dans le dossier de sortie choisi) :
     captures.txt   -> résumé lisible (grille de l'écran + table des champs)
     captures.json  -> même contenu, en détail
-    page_XX.html   -> HTML de chaque capture, nettoyé
 
 Masquage (case cochée par défaut) : codes ISIN et suites de 5 chiffres ou plus
 remplacés par des #. Relis quand même les fichiers avant de les envoyer à
@@ -64,7 +62,8 @@ def chemin_mdp(utilisateur):
     return os.path.join(DOSSIER_MDP, f"mdp{utilisateur}.xlsx")
 
 FRAME_S2I = "crysalid0"
-STABLE_LOGIN_MS = 1500        # S2i redessine le menu en plusieurs passes après le login
+PAUSE_MENU_MS = 5000          # attente fixe après #pf1, avant de taper l'écran
+STABLE_LOGIN_MS = 1500       # S2i redessine le menu en plusieurs passes après le login
 STABLE_ECRAN_MS = 700         # stabilité demandée après ouverture d'un écran
 STABLE_CAPTURE_S = 0.8        # une page doit rester identique 0,8 s avant capture auto
 DELAI_FRAPPE_MS = 150         # délai entre les caractères du code écran
@@ -149,20 +148,7 @@ JS_S2I_INVENTAIRE = r"""
     touches.push({ id: el.id, texte: masquer(t), visible: visible(el) });
   }
 
-  // 3. HTML nettoyé (valeurs courantes des champs recopiées, puis masquées)
-  const copie = document.documentElement.cloneNode(true);
-  const origines = [...document.querySelectorAll("input, textarea")];
-  const clones = [...copie.querySelectorAll("input, textarea")];
-  clones.forEach((n, i) => {
-    const v = masquer(origines[i] ? origines[i].value : "");
-    if (n.tagName === "TEXTAREA") n.textContent = v; else n.setAttribute("value", v);
-  });
-  copie.querySelectorAll("script, img, svg").forEach((n) => n.remove());
-  const marcheur = document.createTreeWalker(copie, NodeFilter.SHOW_TEXT);
-  let noeud;
-  while ((noeud = marcheur.nextNode())) noeud.nodeValue = masquer(noeud.nodeValue);
-
-  return { cellules, touches, html: "<!doctype html>\n" + copie.outerHTML };
+  return { cellules, touches };
 }
 """
 
@@ -412,16 +398,13 @@ def ecrire_fichiers(dossier, outil, ecran, captures):
     for cap in captures:
         lignes += ["", "=" * 100, f"Capture {cap['numero']:02d} - {cap['heure']} - {cap['titre']}", "=" * 100]
         lignes += lignes_resume_s2i(cap) if outil == "S2i" else lignes_resume_cockpit(cap)
-        with open(os.path.join(dossier, f"page_{cap['numero']:02d}.html"), "w", encoding="utf-8") as f:
-            f.write(cap["html"])
 
     with open(os.path.join(dossier, "captures.txt"), "w", encoding="utf-8") as f:
         f.write("\n".join(lignes) + "\n")
 
-    sans_html = [{k: v for k, v in cap.items() if k != "html"} for cap in captures]
     with open(os.path.join(dossier, "captures.json"), "w", encoding="utf-8") as f:
         json.dump({"outil": outil, "ecran": ecran, "date": datetime.now().isoformat(timespec="seconds"),
-                   "captures": sans_html}, f, indent=2, ensure_ascii=False)
+                   "captures": captures}, f, indent=2, ensure_ascii=False)
 
 
 # ------------------------------------------------------------------
@@ -626,6 +609,7 @@ class Robot(threading.Thread):
 
         f = self.attendre_selecteur("#pf1", 20)
         f.click("#pf1")
+        self.pause(PAUSE_MENU_MS)  # comme dans tes robots : pas de repère fiable pour le menu
         if self.attendre_stable(STABLE_LOGIN_MS, 20) is None:
             self.log("Le menu S2i met du temps à se stabiliser, on continue.", "attention")
         self.log("Connecté à S2i.", "ok")
@@ -659,7 +643,7 @@ class Robot(threading.Thread):
         # Étape 2 : navigation libre, capture automatique
         self.etape(2)
         self.emettre("capture_dispo", actif=True)
-        self.log("Capture auto active : saisis la clé si besoin et passe les pages dans Chrome.")
+        self.log("Capture auto active : passe les pages dans Chrome s'il y en a plusieurs.")
         self.boucle(capture_auto=True)
         self.etape(3)
 
@@ -683,7 +667,6 @@ class Robot(threading.Thread):
             "titre": titre_ecran(cellules),
             "cellules": cellules,
             "touches": donnees["touches"],
-            "html": donnees["html"],
         }
         self.captures.append(capture)
         nb_ef = sum(1 for c in cellules if c["genre"] == "EF")
@@ -713,7 +696,6 @@ class Robot(threading.Thread):
             "heure": datetime.now().strftime("%H:%M:%S"),
             "titre": TITRE_MODALE_COCKPIT,
             "champs": champs,
-            "html": resultat["html"],
         }
         self.captures.append(capture)
         self.log(f"Capture {capture['numero']} enregistrée.", "ok")
@@ -755,8 +737,8 @@ class Robot(threading.Thread):
 ETAPES = {
     "S2i": [
         "Connexion automatique à S2i",
-        "Ouverture de l'écran {ecran}",
-        "Dans Chrome : saisis la clé si l'écran en demande une, puis passe les pages. "
+        "Le robot tape {ecran} et ouvre l'écran (rien à faire)",
+        "Dans Chrome : passe les pages s'il y en a plusieurs, ou attends simplement. "
         "Chaque nouvelle page est capturée automatiquement (« Capturer » pour forcer).",
         "Clique sur Terminer : les fichiers sont écrits et Chrome se ferme",
     ],
@@ -809,7 +791,7 @@ class Application(ctk.CTk):
         cadre = ctk.CTkFrame(self, fg_color="transparent")
         cadre.grid(row=0, column=0, sticky="ew", padx=20, pady=(18, 6))
         ctk.CTkLabel(cadre, text="Scraper d'écrans", font=ctk.CTkFont(size=22, weight="bold")).pack(anchor="w")
-        ctk.CTkLabel(cadre, text="Extrait la structure d'un écran S2i ou Cockpit (champs, libellés, HTML)",
+        ctk.CTkLabel(cadre, text="Extrait la structure d'un écran S2i ou Cockpit (champs, libellés, valeurs)",
                      text_color=GRIS).pack(anchor="w")
 
     def construire_parametres(self):
