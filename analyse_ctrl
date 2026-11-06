@@ -1,3 +1,5 @@
+import re
+
 import pandas as pd
 
 # ============================================================
@@ -8,6 +10,21 @@ CHEMIN_BASE_VALEUR = r"P:\CPSI_CONTROL_DATA\SAS_DATA\02_Controles_Referentiel_Va
 CHEMIN_VCOUS = r"P:\CPSI_CONTROL_DATA\SAS_DATA\02_Controles_Referentiel_Valeur\Resultat_Controle_Jour\vcous_sas.csv"
 CHEMIN_SORTIE = r"C:\Users\ut34e9\Desktop\Python\Analyse_controle\analyse_c14.xlsx"
 CHEMIN_TRANSCO_PL_BRS = r"P:\CPSI_CONTROL_DATA\SAS_DATA\02_Controles_Referentiel_Valeur\DATA_INPUT\Transco_PlaceBourse_CAT.csv"
+
+
+# ============================================================
+# PRIVATE EQUITY (à compléter au fil de l'eau)
+# ============================================================
+# Mots-clés cherchés dans S2I_Security_Name (insensible à la casse)
+MOTS_CLES_PE = [
+    r"\bPR\.?\s*EQ",           # PR EQ, PR.EQ, PREQ
+    r"\bPRIV(?:ATE)?\.?\s*EQ",   # PRIVATE EQUITY, PRIV EQ
+]
+# Noms de titres connus comme private equity
+NOMS_PE = [
+    "TIERRA CAPITAL",
+    "EURAZEO",
+]
 
 
 # ============================================================
@@ -52,13 +69,13 @@ data_bv = pd.read_csv(
     sep=";",
     encoding="ISO-8859-1",
     low_memory=False,
-    usecols=["Security_S2I", "S2I_Date_Depart", "S2I_Ccy", "S2I_PL_BRS_CRS_EST"],
+    # Colonnes absentes du fichier ignorées sans erreur
+    usecols=lambda c: c in {"Security_S2I", "S2I_Date_Depart", "S2I_Ccy", "S2I_PL_BRS_CRS_EST", "S2I_Security_Name"},
     dtype={"S2I_PL_BRS_CRS_EST": str},
 )
 
-# Si le C14 a déjà la place S2i, on garde celle du C14 (évite les colonnes _x / _y)
-if "S2I_PL_BRS_CRS_EST" in c14.columns:
-    data_bv = data_bv.drop(columns="S2I_PL_BRS_CRS_EST")
+# Si le C14 a déjà ces colonnes, on garde celles du C14 (évite les colonnes _x / _y)
+data_bv = data_bv.drop(columns=[c for c in ["S2I_PL_BRS_CRS_EST", "S2I_Security_Name"] if c in c14.columns], errors="ignore")
 
 transco_pl = pd.read_csv(
     CHEMIN_TRANSCO_PL_BRS,
@@ -191,6 +208,25 @@ resultat["places_S2I_proposees"] = resultat["places_actives_CAT"].map(
 resultat.loc[resultat["verdict_invariance"] != "Mauvaise place S2i probable", "places_S2I_proposees"] = pd.NA
 
 resultat = resultat.drop(columns=["_active", "_notre_active", "_place_active"])
+
+# Private equity : mots-clés ou nom connu dans le libellé
+motif_pe = "|".join(MOTS_CLES_PE + [re.escape(n) for n in NOMS_PE])
+est_pe = resultat["S2I_Security_Name"].astype("string").str.contains(motif_pe, case=False, regex=True, na=False)
+resultat["private_equity"] = est_pe.map({True: "Oui", False: "Non"})
+
+
+# ============================================================
+# ACTION À MENER
+# ============================================================
+ACTIONS = {
+    "Vraie invariance": "Interroger CAT : titre éteint ou MAJ du cours ?",
+    "Absent vcous": "Interroger CAT : titre inconnu ou mal catégorisé ?",
+    "Mauvaise place S2i probable": "Corriger la place S2i (voir places_S2I_proposees)",
+    "Notre place cote : problème en amont": "Vérifier le flux / l'alimentation du cours",
+    "Fausse invariance probable (place S2i sans transco)": "Compléter la transco des places",
+}
+resultat["action"] = resultat["verdict_invariance"].map(ACTIONS)
+resultat.loc[est_pe, "action"] = "Interroger l'équipe Private Equity (mode de valorisation)"
 
 print(f"Veille ouvrée de référence : {VEILLE_OUVREE}")
 print(resultat)
