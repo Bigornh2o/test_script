@@ -22,7 +22,7 @@ MOTS_CLES_PE = [
 ]
 # Noms de titres connus comme private equity
 NOMS_PE = [
-    "TIERRA CAPITAL",
+    "TIERRA",
     "EURAZEO",
 ]
 
