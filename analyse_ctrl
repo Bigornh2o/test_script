@@ -68,15 +68,26 @@ vcous = nettoyer_texte(vcous)
 # Date de cotation : 20261105.0 -> 05/11/2026
 vcous["cotation_date"] = date_yyyymmdd_vers_fr(vcous["cotation_date"])
 
-# Codes numériques : 186.0 -> 186
-for col in ["code_place_cotation", "code_security_type"]:
-    vcous[col] = pd.to_numeric(vcous[col], errors="coerce").astype("Int64")
+# Code place en texte sur 3 caractères : 4.0 -> "004", 25.0 -> "025"
+vcous["code_place_cotation"] = (
+    pd.to_numeric(vcous["code_place_cotation"], errors="coerce")
+    .astype("Int64")
+    .astype("string")
+    .str.zfill(3)
+)
+
+# Code type de titre : 7.0 -> 7
+vcous["code_security_type"] = pd.to_numeric(vcous["code_security_type"], errors="coerce").astype("Int64")
 
 
 # ============================================================
 # MERGE + EXPORT
 # ============================================================
 resultat = c14.merge(data_bv, on="Security_S2I", how="left")
+
+# foreign_local : suffixe .0xx -> F, .1xx -> E
+suffixe = resultat["Security_S2I"].astype("string").str.rsplit(".", n=1).str[1]
+resultat["foreign_local"] = suffixe.str[0].map({"0": "F", "1": "E"})
 
 print(resultat)
 
