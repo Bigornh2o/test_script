@@ -24,6 +24,17 @@ def date_yyyymmdd_vers_fr(serie):
     return pd.to_datetime(dates, format="%Y%m%d", errors="coerce").dt.strftime("%d/%m/%Y")
 
 
+def code_3_car(serie):
+    """Code place en texte sur 3 caractères : 4 / 4.0 -> '004', 25 -> '025', '9WY' inchangé."""
+    return (
+        serie.astype("string")
+        .str.strip()
+        .str.replace(r"\.0+$", "", regex=True)   # 4.0 -> 4
+        .replace("", pd.NA)
+        .str.zfill(3)
+    )
+
+
 def nettoyer_texte(df):
     """Strip des colonnes texte + chaînes vides -> NaN."""
     cols = df.select_dtypes(include=["object", "string"]).columns
@@ -41,7 +52,19 @@ data_bv = pd.read_csv(
     sep=";",
     encoding="ISO-8859-1",
     low_memory=False,
-    usecols=["Security_S2I", "S2I_Date_Depart", "S2I_Ccy"],
+    usecols=["Security_S2I", "S2I_Date_Depart", "S2I_Ccy", "S2I_PL_BRS_CRS_EST"],
+    dtype={"S2I_PL_BRS_CRS_EST": str},
+)
+
+# Si le C14 a déjà la place S2i, on garde celle du C14 (évite les colonnes _x / _y)
+if "S2I_PL_BRS_CRS_EST" in c14.columns:
+    data_bv = data_bv.drop(columns="S2I_PL_BRS_CRS_EST")
+
+transco_pl = pd.read_csv(
+    CHEMIN_TRANSCO_PL_BRS,
+    sep=";",
+    encoding="ISO-8859-1",
+    dtype=str,
 )
 
 vcous = pd.read_csv(
@@ -70,11 +93,28 @@ vcous = nettoyer_texte(vcous)
 vcous["cotation_date"] = date_yyyymmdd_vers_fr(vcous["cotation_date"])
 
 # Code place en texte sur 3 caractères : 4.0 -> "004", 25.0 -> "025"
-vcous["code_place_cotation"] = (
-    pd.to_numeric(vcous["code_place_cotation"], errors="coerce")
-    .astype("Int64")
-    .astype("string")
-    .str.zfill(3)
+vcous["code_place_cotation"] = code_3_car(vcous["code_place_cotation"])
+
+
+# ============================================================
+# NETTOYAGE TRANSCO PLACES (S2i -> CAT)
+# ============================================================
+transco_pl = nettoyer_texte(transco_pl)
+transco_pl["S2I_PL_BRS_CRS_EST"] = code_3_car(transco_pl["S2I_PL_BRS_CRS_EST"])
+transco_pl["CAT_Code_Marche"] = code_3_car(transco_pl["CAT_Code_Marche"])
+
+# Place S2i -> code CAT (une place S2i = un code CAT)
+map_s2i_vers_cat = (
+    transco_pl.dropna(subset=["S2I_PL_BRS_CRS_EST"])
+    .drop_duplicates("S2I_PL_BRS_CRS_EST")
+    .set_index("S2I_PL_BRS_CRS_EST")["CAT_Code_Marche"]
+)
+
+# Code CAT -> place(s) S2i (un code CAT peut correspondre à plusieurs places S2i, ex. 076 -> 9LW / 9LV)
+map_cat_vers_s2i = (
+    transco_pl.dropna(subset=["S2I_PL_BRS_CRS_EST", "CAT_Code_Marche"])
+    .groupby("CAT_Code_Marche")["S2I_PL_BRS_CRS_EST"]
+    .agg(lambda s: "/".join(sorted(s.unique())))
 )
 
 # Colonnes gardées + suffixe _VCOUS
@@ -114,14 +154,43 @@ VEILLE_OUVREE = (pd.Timestamp.today().normalize() - pd.offsets.BDay(1)).strftime
 resultat["place_active_VCOUS"] = (resultat["cotation_date_VCOUS"] == VEILLE_OUVREE).map({True: "Oui", False: "Non"})
 resultat.loc[resultat["ISIN_VCOUS"].isna(), "place_active_VCOUS"] = pd.NA
 
+# Notre place S2i traduite en code CAT
+resultat["S2I_PL_BRS_CRS_EST"] = code_3_car(resultat["S2I_PL_BRS_CRS_EST"])
+resultat["CAT_Code_Place_S2I"] = resultat["S2I_PL_BRS_CRS_EST"].map(map_s2i_vers_cat)
+
+# La ligne vcous est-elle notre place S2i ?
+resultat["notre_place_VCOUS"] = (
+    resultat["code_place_cotation_VCOUS"] == resultat["CAT_Code_Place_S2I"]
+).map({True: "Oui", False: "Non"})
+resultat.loc[resultat["ISIN_VCOUS"].isna(), "notre_place_VCOUS"] = pd.NA
+
 # Verdict par titre (toutes ses places confondues)
+active = resultat["place_active_VCOUS"] == "Oui"
+resultat["_active"] = active
+resultat["_notre_active"] = active & (resultat["notre_place_VCOUS"] == "Oui")
+resultat["_place_active"] = resultat["code_place_cotation_VCOUS"].where(active)
+
 groupe = resultat.groupby("Security_S2I", dropna=False)
 present_vcous = groupe["ISIN_VCOUS"].transform(lambda s: s.notna().any())
-au_moins_une_active = groupe["place_active_VCOUS"].transform(lambda s: (s == "Oui").any())
+au_moins_une_active = groupe["_active"].transform("any")
+notre_place_active = groupe["_notre_active"].transform("any")
+sans_transco = resultat["CAT_Code_Place_S2I"].isna()
 
 resultat["verdict_invariance"] = "Vraie invariance"
-resultat.loc[au_moins_une_active, "verdict_invariance"] = "Fausse invariance probable"
+resultat.loc[au_moins_une_active, "verdict_invariance"] = "Mauvaise place S2i probable"
+resultat.loc[au_moins_une_active & sans_transco, "verdict_invariance"] = "Fausse invariance probable (place S2i sans transco)"
+resultat.loc[notre_place_active, "verdict_invariance"] = "Notre place cote : problème en amont"
 resultat.loc[~present_vcous, "verdict_invariance"] = "Absent vcous"
+
+# Places actives hier chez le provider (codes CAT) et leur équivalent S2i
+places_actives = groupe["_place_active"].transform(lambda s: "/".join(sorted(s.dropna().unique())))
+resultat["places_actives_CAT"] = places_actives.replace("", pd.NA)
+resultat["places_S2I_proposees"] = resultat["places_actives_CAT"].map(
+    lambda codes: "/".join(map_cat_vers_s2i.get(c, f"{c}?") for c in codes.split("/")) if isinstance(codes, str) else pd.NA
+)
+resultat.loc[resultat["verdict_invariance"] != "Mauvaise place S2i probable", "places_S2I_proposees"] = pd.NA
+
+resultat = resultat.drop(columns=["_active", "_notre_active", "_place_active"])
 
 print(f"Veille ouvrée de référence : {VEILLE_OUVREE}")
 print(resultat)
