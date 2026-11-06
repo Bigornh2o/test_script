@@ -92,13 +92,13 @@ resultat = c14.merge(data_bv, on="Security_S2I", how="left")
 suffixe = resultat["Security_S2I"].astype("string").str.rsplit(".", n=1).str[1]
 resultat["foreign_local"] = suffixe.str[0].map({"0": "F", "1": "E"})
 
-# Merge vcous sur ISIN (partie avant le point de Security_S2I) + foreign_local
+# Merge vcous sur ISIN (partie avant le point de Security_S2I) + foreign_local + devise (S2I_Ccy)
 resultat["_cle_isin"] = resultat["Security_S2I"].astype("string").str.rsplit(".", n=1).str[0]
 
 resultat = resultat.merge(
     vcous,
-    left_on=["_cle_isin", "foreign_local"],
-    right_on=["ISIN_VCOUS", "foreign_local_VCOUS"],
+    left_on=["_cle_isin", "foreign_local", "S2I_Ccy"],
+    right_on=["ISIN_VCOUS", "foreign_local_VCOUS", "currency_VCOUS"],
     how="left",
 ).drop(columns="_cle_isin")  # 1 ligne par place de cotation (doublons attendus)
 
