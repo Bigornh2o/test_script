@@ -76,8 +76,11 @@ vcous["code_place_cotation"] = (
     .str.zfill(3)
 )
 
-# Code type de titre : 7.0 -> 7
-vcous["code_security_type"] = pd.to_numeric(vcous["code_security_type"], errors="coerce").astype("Int64")
+# Colonnes gardées + suffixe _VCOUS
+vcous = vcous[[
+    "ISIN", "cotation_date", "code_place_cotation",
+    "clean_price", "currency", "foreign_local",
+]].add_suffix("_VCOUS")
 
 
 # ============================================================
@@ -88,6 +91,20 @@ resultat = c14.merge(data_bv, on="Security_S2I", how="left")
 # foreign_local : suffixe .0xx -> F, .1xx -> E
 suffixe = resultat["Security_S2I"].astype("string").str.rsplit(".", n=1).str[1]
 resultat["foreign_local"] = suffixe.str[0].map({"0": "F", "1": "E"})
+
+# Merge vcous sur ISIN (partie avant le point de Security_S2I) + foreign_local
+resultat["_cle_isin"] = resultat["Security_S2I"].astype("string").str.rsplit(".", n=1).str[0]
+
+nb_avant = len(resultat)
+resultat = resultat.merge(
+    vcous,
+    left_on=["_cle_isin", "foreign_local"],
+    right_on=["ISIN_VCOUS", "foreign_local_VCOUS"],
+    how="left",
+).drop(columns="_cle_isin")
+
+if len(resultat) != nb_avant:
+    print(f"/!\\ Le merge vcous a dupliqué des lignes : {nb_avant} -> {len(resultat)}")
 
 print(resultat)
 
