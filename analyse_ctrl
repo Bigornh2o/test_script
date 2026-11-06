@@ -1,63 +1,83 @@
 import pandas as pd
 
-c14 = pd.read_csv(
-    r"C:\Users\ut34e9\Downloads\controle_C14.Cours_invariants_1793954691.csv",
-    sep=';'
-)
-
+# ============================================================
+# CHEMINS
+# ============================================================
+CHEMIN_C14 = r"C:\Users\ut34e9\Downloads\controle_C14.Cours_invariants_1793954691.csv"
 CHEMIN_BASE_VALEUR = r"P:\CPSI_CONTROL_DATA\SAS_DATA\02_Controles_Referentiel_Valeur\Resultat_Controle_Jour\BaseValeurfinale.csv"
 CHEMIN_VCOUS = r"P:\CPSI_CONTROL_DATA\SAS_DATA\02_Controles_Referentiel_Valeur\Resultat_Controle_Jour\vcous_sas.csv"
+CHEMIN_SORTIE = r"C:\Users\ut34e9\Desktop\Python\Analyse_controle\analyse_c14.xlsx"
 
-# Load BaseValeurfinale
+
+# ============================================================
+# OUTILS
+# ============================================================
+def date_yyyymmdd_vers_fr(serie):
+    """yyyymmdd (int/float/str) -> 'dd/mm/yyyy'. Vides et 0 -> NaN."""
+    dates = (
+        pd.to_numeric(serie, errors="coerce")
+        .astype("Int64")          # supprime le .0, garde les vides en <NA>
+        .astype("string")
+        .replace("0", pd.NA)
+    )
+    return pd.to_datetime(dates, format="%Y%m%d", errors="coerce").dt.strftime("%d/%m/%Y")
+
+
+def nettoyer_texte(df):
+    """Strip des colonnes texte + chaînes vides -> NaN."""
+    cols = df.select_dtypes(include=["object", "string"]).columns
+    df[cols] = df[cols].apply(lambda s: s.str.strip()).replace("", pd.NA)
+    return df
+
+
+# ============================================================
+# CHARGEMENT
+# ============================================================
+c14 = pd.read_csv(CHEMIN_C14, sep=";")
+
 data_bv = pd.read_csv(
     CHEMIN_BASE_VALEUR,
-    sep=';',
+    sep=";",
     encoding="ISO-8859-1",
     low_memory=False,
-    dtype={"S2I_Genre": str}
+    usecols=["Security_S2I", "S2I_Date_Depart", "S2I_Ccy"],
 )
 
-# Load Vcous
 vcous = pd.read_csv(
     CHEMIN_VCOUS,
-    sep=';', 
-    encoding="ISO-8859-1"
+    sep=";",
+    encoding="ISO-8859-1",
+    low_memory=False,
 )
 
 
-data_bv = data_bv[['Security_S2I', 'S2I_Date_Depart', 'S2I_Ccy']]
-
-# Conversion yyyymmdd (int/float) -> dd/mm/yyyy
-dates = (
-    pd.to_numeric(data_bv["S2I_Date_Depart"], errors="coerce")
-    .astype("Int64")          # supprime le .0, garde les vides en <NA>
-    .astype("string")
-    .replace("0", pd.NA)
-)
-
-data_bv["S2I_Date_Depart"] = pd.to_datetime(
-    dates,
-    format="%Y%m%d",
-    errors="coerce"
-).dt.strftime("%d/%m/%Y")
-
-resultat = c14.merge(
-    data_bv,
-    on="Security_S2I",
-    how="left"
-)
+# ============================================================
+# NETTOYAGE BASE VALEUR
+# ============================================================
+data_bv["S2I_Date_Depart"] = date_yyyymmdd_vers_fr(data_bv["S2I_Date_Depart"])
 
 
+# ============================================================
+# NETTOYAGE VCOUS
+# ============================================================
+# Colonne d'index exportée par SAS/pandas (0, 1, 2...) sans nom
+vcous = vcous.loc[:, ~vcous.columns.str.startswith("Unnamed")]
+
+vcous = nettoyer_texte(vcous)
+
+# Date de cotation : 20261105.0 -> 05/11/2026
+vcous["cotation_date"] = date_yyyymmdd_vers_fr(vcous["cotation_date"])
+
+# Codes numériques : 186.0 -> 186
+for col in ["code_place_cotation", "code_security_type"]:
+    vcous[col] = pd.to_numeric(vcous[col], errors="coerce").astype("Int64")
 
 
-
-
-
-
+# ============================================================
+# MERGE + EXPORT
+# ============================================================
+resultat = c14.merge(data_bv, on="Security_S2I", how="left")
 
 print(resultat)
 
-resultat.to_excel(
-    r"C:\Users\ut34e9\Desktop\Python\Analyse_controle\analyse_c14.xlsx",
-    index=False
-)
+resultat.to_excel(CHEMIN_SORTIE, index=False)
