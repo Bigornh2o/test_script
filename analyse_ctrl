@@ -102,6 +102,27 @@ resultat = resultat.merge(
     how="left",
 ).drop(columns="_cle_isin")  # 1 ligne par place de cotation (doublons attendus)
 
+
+# ============================================================
+# QUALIFICATION DES INVARIANCES
+# ============================================================
+# Veille ouvrée par rapport au jour d'exécution (lundi -> vendredi)
+VEILLE_OUVREE = (pd.Timestamp.today().normalize() - pd.offsets.BDay(1)).strftime("%d/%m/%Y")
+
+# La place a-t-elle coté hier chez le provider ?
+resultat["place_active_VCOUS"] = (resultat["cotation_date_VCOUS"] == VEILLE_OUVREE).map({True: "Oui", False: "Non"})
+resultat.loc[resultat["ISIN_VCOUS"].isna(), "place_active_VCOUS"] = pd.NA
+
+# Verdict par titre (toutes ses places confondues)
+groupe = resultat.groupby("Security_S2I", dropna=False)
+present_vcous = groupe["ISIN_VCOUS"].transform(lambda s: s.notna().any())
+au_moins_une_active = groupe["place_active_VCOUS"].transform(lambda s: (s == "Oui").any())
+
+resultat["verdict_invariance"] = "Vraie invariance"
+resultat.loc[au_moins_une_active, "verdict_invariance"] = "Fausse invariance probable"
+resultat.loc[~present_vcous, "verdict_invariance"] = "Absent vcous"
+
+print(f"Veille ouvrée de référence : {VEILLE_OUVREE}")
 print(resultat)
 
 resultat.to_excel(CHEMIN_SORTIE, index=False)
