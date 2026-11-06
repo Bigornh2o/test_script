@@ -95,16 +95,12 @@ resultat["foreign_local"] = suffixe.str[0].map({"0": "F", "1": "E"})
 # Merge vcous sur ISIN (partie avant le point de Security_S2I) + foreign_local
 resultat["_cle_isin"] = resultat["Security_S2I"].astype("string").str.rsplit(".", n=1).str[0]
 
-nb_avant = len(resultat)
 resultat = resultat.merge(
     vcous,
     left_on=["_cle_isin", "foreign_local"],
     right_on=["ISIN_VCOUS", "foreign_local_VCOUS"],
     how="left",
-).drop(columns="_cle_isin")
-
-if len(resultat) != nb_avant:
-    print(f"/!\\ Le merge vcous a dupliqué des lignes : {nb_avant} -> {len(resultat)}")
+).drop(columns="_cle_isin")  # 1 ligne par place de cotation (doublons attendus)
 
 print(resultat)
 
