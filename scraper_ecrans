@@ -1,0 +1,1069 @@
+"""
+Scraper d'écrans S2i / Cockpit — interface CustomTkinter.
+
+Usage :
+    python scraper_ecrans.py
+
+S2i :
+    1. Choisis « S2i », tape l'écran (OVAL, IOVT, RRTI...) et clique sur Lancer.
+    2. Le robot se connecte tout seul (identifiants lus dans le fichier mdp)
+       et ouvre l'écran demandé.
+    3. Dans Chrome, saisis la clé de recherche si l'écran en demande une, puis
+       passe les pages comme d'habitude : chaque nouvelle page est capturée
+       automatiquement dès qu'elle est stable. Le bouton « Capturer » force une
+       capture (utile si seules des valeurs ont changé).
+    4. Clique sur Terminer : les fichiers sont écrits et Chrome se ferme.
+
+Cockpit :
+    1. Choisis « Cockpit » et clique sur Lancer.
+    2. Connecte-toi dans Chrome, ouvre la fenêtre à capturer
+       (ex. Statements > Portfolio > « Portfolio Statement Parameters »).
+    3. Clique sur Capturer, puis sur Terminer.
+
+Le robot ne valide rien et ne clique jamais sur un bouton d'action métier.
+
+Sorties (un dossier par session, dans le dossier de sortie choisi) :
+    captures.txt   -> résumé lisible (grille de l'écran + table des champs)
+    captures.json  -> même contenu, en détail
+    page_XX.html   -> HTML de chaque capture, nettoyé
+
+Masquage (case cochée par défaut) : codes ISIN et suites de 5 chiffres ou plus
+remplacés par des #. Relis quand même les fichiers avant de les envoyer à
+l'extérieur, selon les règles internes.
+"""
+
+import json
+import os
+import queue
+import re
+import sys
+import threading
+import time
+from collections import defaultdict
+from datetime import datetime
+from tkinter import filedialog, messagebox
+
+import customtkinter as ctk
+from playwright.sync_api import sync_playwright
+
+# ------------------------------------------------------------------
+# Paramètres
+# ------------------------------------------------------------------
+CHROME_PATH = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+
+URL_S2I = "https://s2i-frontindprd.ch.pbk/caiportal/index2.html"
+URL_COCKPIT = "https://cockpitind.ch.pbk/#/login"
+TITRE_MODALE_COCKPIT = "Portfolio Statement Parameters"
+
+DOSSIER_MDP = r"P:\CPSI_CONTROL_DATA\SAS_DATA\000_Parametres_Documents"
+UTILISATEURS = ["BIMTE", "BII4G", "BIVKG"]
+
+
+def chemin_mdp(utilisateur):
+    """Fichier d'identifiants d'un user S2i : mdp<USER>.xlsx (ex. mdpBIMTE.xlsx)."""
+    return os.path.join(DOSSIER_MDP, f"mdp{utilisateur}.xlsx")
+
+FRAME_S2I = "crysalid0"
+STABLE_LOGIN_MS = 1500        # S2i redessine le menu en plusieurs passes après le login
+STABLE_ECRAN_MS = 700         # stabilité demandée après ouverture d'un écran
+STABLE_CAPTURE_S = 0.8        # une page doit rester identique 0,8 s avant capture auto
+DELAI_FRAPPE_MS = 150         # délai entre les caractères du code écran
+
+if getattr(sys, "frozen", False):
+    DOSSIER_SCRIPT = os.path.dirname(sys.executable)
+else:
+    DOSSIER_SCRIPT = os.path.dirname(os.path.abspath(sys.argv[0])) or "."
+
+CHEMIN_CONFIG = os.path.join(DOSSIER_SCRIPT, "scraper_ecrans_config.json")
+DOSSIER_SORTIE_DEFAUT = os.path.join(DOSSIER_SCRIPT, "captures")
+
+if sys.stdout is not None:
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+
+# ------------------------------------------------------------------
+# Masquage (côté Python)
+# ------------------------------------------------------------------
+RE_ISIN = re.compile(r"\b[A-Z]{2}[A-Z0-9]{9}\d\b")
+RE_CHIFFRES = re.compile(r"\d{5,}")
+
+
+def masquer(texte):
+    texte = "" if texte is None else str(texte)
+    texte = RE_ISIN.sub(lambda m: m.group()[:2] + "#" * (len(m.group()) - 2), texte)
+    return RE_CHIFFRES.sub(lambda m: "#" * len(m.group()), texte)
+
+
+# ------------------------------------------------------------------
+# JavaScript S2i (exécuté dans la frame crysalid0)
+# ------------------------------------------------------------------
+JS_S2I_SIGNATURE = r"""
+() => {
+  if (!document.body) return "";
+  const ids = [...document.querySelectorAll("[id^='EF_']")].map((e) => e.id).join(",");
+  return document.body.innerText + "|" + ids;
+}
+"""
+
+JS_S2I_INVENTAIRE = r"""
+(masquerActif) => {
+  const masquer = (t) => {
+    t = String(t ?? "");
+    if (!masquerActif) return t;
+    return t
+      .replace(/\b[A-Z]{2}[A-Z0-9]{9}\d\b/g, (m) => m.slice(0, 2) + "#".repeat(m.length - 2))
+      .replace(/\d{5,}/g, (m) => "#".repeat(m.length));
+  };
+  const visible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+
+  // 1. Cellules EF_ligne_col (saisie) et ST_ligne_col (texte)
+  const cellules = [];
+  for (const el of document.querySelectorAll("[id]")) {
+    const m = /^(EF|ST)_(\d+)_(\d+)$/.exec(el.id);
+    if (!m) continue;
+    const tag = el.tagName.toLowerCase();
+    const saisie = tag === "input" || tag === "textarea" || tag === "select";
+    const brut = saisie ? (el.value ?? "") : (el.innerText ?? el.textContent ?? "");
+    cellules.push({
+      id: el.id,
+      genre: m[1],
+      ligne: +m[2],
+      col: +m[3],
+      balise: tag,
+      type: tag === "input" ? (el.type || "") : "",
+      texte: masquer(String(brut).replace(/\u00a0/g, " ").replace(/[\r\n]+/g, " ").replace(/\s+$/, "")),
+      longueur_max: el.maxLength > 0 ? el.maxLength : null,
+      lecture_seule: !!(el.readOnly || el.disabled),
+      visible: visible(el),
+    });
+  }
+
+  // 2. Touches de fonction (pf1, pf2...)
+  const touches = [];
+  for (const el of document.querySelectorAll("[id^='pf']")) {
+    if (!/^pf\d+$/.test(el.id)) continue;
+    const t = (el.innerText || el.value || el.title || "").replace(/\s+/g, " ").trim();
+    touches.push({ id: el.id, texte: masquer(t), visible: visible(el) });
+  }
+
+  // 3. HTML nettoyé (valeurs courantes des champs recopiées, puis masquées)
+  const copie = document.documentElement.cloneNode(true);
+  const origines = [...document.querySelectorAll("input, textarea")];
+  const clones = [...copie.querySelectorAll("input, textarea")];
+  clones.forEach((n, i) => {
+    const v = masquer(origines[i] ? origines[i].value : "");
+    if (n.tagName === "TEXTAREA") n.textContent = v; else n.setAttribute("value", v);
+  });
+  copie.querySelectorAll("script, img, svg").forEach((n) => n.remove());
+  const marcheur = document.createTreeWalker(copie, NodeFilter.SHOW_TEXT);
+  let noeud;
+  while ((noeud = marcheur.nextNode())) noeud.nodeValue = masquer(noeud.nodeValue);
+
+  return { cellules, touches, html: "<!doctype html>\n" + copie.outerHTML };
+}
+"""
+
+
+# ------------------------------------------------------------------
+# JavaScript Cockpit (repris de extraire_modale_cockpit.py)
+# ------------------------------------------------------------------
+JS_COCKPIT_INVENTAIRE = r"""
+(titreModale) => {
+  const visible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+  const texte = (el) => (el ? (el.innerText || el.textContent || "") : "").replace(/\s+/g, " ").trim();
+  const masquer = (t) => String(t || "").replace(/\d{5,}/g, (m) => "#".repeat(m.length));
+
+  const controles = [...document.querySelectorAll("[formcontrolname]")].filter(visible);
+  if (!controles.length) return { erreur: "Aucun champ [formcontrolname] visible : la fenêtre est-elle ouverte ?" };
+
+  const ancetres = (el) => { const l = []; while (el) { l.push(el); el = el.parentElement; } return l; };
+  let racine = controles[0];
+  for (const cand of ancetres(controles[0])) {
+    if (controles.every((c) => cand.contains(c))) { racine = cand; break; }
+  }
+
+  const libelle = (el) => {
+    if (el.id) {
+      const l = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+      if (l) return texte(l);
+    }
+    const lab = el.closest("label");
+    if (lab) return texte(lab);
+    let a = el.parentElement;
+    for (let i = 0; i < 4 && a && a !== racine; i++, a = a.parentElement) {
+      const cands = [...a.querySelectorAll("label, .label, [class*='label'], span, p")]
+        .filter((x) => !x.contains(el) && !el.contains(x) && visible(x) && texte(x).length > 0 && texte(x).length < 80
+                       && !x.closest("ng-select, button, .ng-dropdown-panel"));
+      const avant = cands.filter((x) => x.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING);
+      if (avant.length) return texte(avant[avant.length - 1]);
+      if (cands.length) return texte(cands[0]);
+    }
+    return "";
+  };
+
+  const elements = [racine, ...racine.querySelectorAll("*")];
+  const resultat = [];
+  let section = "";
+  const deja = new Set();
+
+  const estTitre = (el) => {
+    if (!visible(el) || el.closest("button, label, ng-select, .ng-dropdown-panel")) return false;
+    if (/^H[1-6]$|^LEGEND$/.test(el.tagName)) return true;
+    if (el.childElementCount !== 0) return false;
+    const t = texte(el);
+    return t.length >= 4 && t.length <= 60 && /[A-Z]/.test(t) && t === t.toUpperCase() && !/^[\d\s.,/-]+$/.test(t);
+  };
+
+  for (const el of elements) {
+    if (estTitre(el)) {
+      section = texte(el);
+      resultat.push({ genre: "section", titre: section });
+      continue;
+    }
+    if (!visible(el)) continue;
+
+    const fcn = el.getAttribute("formcontrolname");
+    const tag = el.tagName.toLowerCase();
+    const estCase = tag === "input" && el.type === "checkbox";
+
+    if (fcn || estCase || tag === "textarea" || (tag === "input" && !el.closest("[formcontrolname]"))) {
+      if (deja.has(el)) continue;
+      deja.add(el);
+      const champ = {
+        genre: "champ",
+        section,
+        libelle: masquer(libelle(el)),
+        formcontrolname: fcn || (el.closest("[formcontrolname]") ? el.closest("[formcontrolname]").getAttribute("formcontrolname") : ""),
+        balise: tag,
+        type: tag === "input" ? el.type : "",
+        id: el.id || "",
+        obligatoire: el.hasAttribute("required") || /\*/.test(libelle(el)),
+        classes: (el.className && typeof el.className === "string") ? el.className.split(/\s+/).filter((c) => c && !c.startsWith("ng-tns")).slice(0, 8).join(" ") : "",
+      };
+      if (estCase) {
+        champ.coche = el.checked;
+      } else if (tag === "ng-select" || el.querySelector(".ng-value, .ng-select-container")) {
+        champ.liste_deroulante = true;
+        champ.valeur = masquer(texte(el.querySelector(".ng-value-label, .ng-value")));
+        champ.croix_pour_vider = !!el.querySelector(".ng-clear-wrapper");
+      } else if (tag === "textarea" || (tag === "input" && /text|search|email|tel|url|number/.test(el.type))) {
+        const v = el.value || "";
+        champ.valeur = (fcn === "valuationDate") ? v : `<${v.length} caractères>`;
+        if (el.maxLength > 0) champ.longueur_max = el.maxLength;
+      } else if (tag === "input") {
+        champ.valeur = el.type === "radio" ? (el.checked ? "sélectionné" : "") : "";
+      }
+      resultat.push(champ);
+      continue;
+    }
+
+    if (tag === "button" && !el.closest("ng-select")) {
+      const t = texte(el);
+      if (!t) continue;
+      resultat.push({
+        genre: "bouton",
+        section,
+        texte: masquer(t),
+        actif: /active|selected|primary|btn-dark/.test(el.className) || el.getAttribute("aria-pressed") === "true",
+        classes: (typeof el.className === "string") ? el.className.split(/\s+/).filter((c) => c && !c.startsWith("ng-tns")).slice(0, 8).join(" ") : "",
+      });
+    }
+  }
+
+  const copie = racine.cloneNode(true);
+  copie.querySelectorAll("script, style, svg, img").forEach((n) => n.remove());
+  copie.querySelectorAll("*").forEach((n) => {
+    [...n.attributes].forEach((a) => {
+      if (/^_ng|^ng-reflect|^style$/.test(a.name)) n.removeAttribute(a.name);
+      if (a.name === "value" && !(n.type === "checkbox" || n.type === "radio")) n.setAttribute("value", "");
+    });
+    if (n.tagName === "TEXTAREA") n.textContent = "";
+  });
+  const marcheur = document.createTreeWalker(copie, NodeFilter.SHOW_TEXT);
+  let noeud;
+  while ((noeud = marcheur.nextNode())) noeud.nodeValue = masquer(noeud.nodeValue);
+
+  return { champs: resultat, html: copie.outerHTML.replace(/\n\s*\n+/g, "\n") };
+}
+"""
+
+
+# ------------------------------------------------------------------
+# Analyse d'un écran S2i
+# ------------------------------------------------------------------
+def deduire_libelles(cellules):
+    """Libellé d'un EF = texte ST le plus proche à sa gauche sur la même ligne,
+    sinon ST juste au-dessus (même colonne, à 2 près)."""
+    st_par_ligne = defaultdict(list)
+    for c in cellules:
+        if c["genre"] == "ST" and c["visible"] and c["texte"].strip():
+            st_par_ligne[c["ligne"]].append(c)
+
+    def nettoyer(t):
+        return t.strip().rstrip(":.").strip()
+
+    for c in cellules:
+        if c["genre"] != "EF":
+            continue
+        gauche = [s for s in st_par_ligne.get(c["ligne"], []) if s["col"] < c["col"]]
+        if gauche:
+            c["libelle"] = nettoyer(max(gauche, key=lambda s: s["col"])["texte"])
+            continue
+        dessus = [s for s in st_par_ligne.get(c["ligne"] - 1, []) if abs(s["col"] - c["col"]) <= 2]
+        c["libelle"] = nettoyer(dessus[0]["texte"]) if dessus else ""
+
+
+def titre_ecran(cellules):
+    st = [c for c in cellules if c["genre"] == "ST" and c["visible"] and c["texte"].strip()]
+    if not st:
+        return "(écran sans texte)"
+    premiere = min(c["ligne"] for c in st)
+    textes = [c["texte"].strip() for c in sorted(st, key=lambda c: c["col"]) if c["ligne"] == premiere]
+    return " ".join(textes)[:80]
+
+
+def construire_grille(cellules):
+    """Reconstitue l'écran texte : ST tels quels, EF en valeur complétée par des _."""
+    visibles = [c for c in cellules if c["visible"]]
+    if not visibles:
+        return []
+    min_col = min(c["col"] for c in visibles)
+    decalage = 1 if min_col >= 1 else 0
+
+    morceaux = []
+    for c in visibles:
+        if c["genre"] == "EF":
+            largeur = c["longueur_max"] or max(len(c["texte"]), 1)
+            txt = c["texte"][:largeur].ljust(largeur, "_")
+        else:
+            txt = c["texte"]
+        morceaux.append((c["ligne"], c["col"] - decalage, txt))
+
+    largeur = max(col + len(t) for _, col, t in morceaux)
+    lignes_min = min(l for l, _, _ in morceaux)
+    lignes_max = max(l for l, _, _ in morceaux)
+    grille = {l: [" "] * largeur for l in range(lignes_min, lignes_max + 1)}
+    for l, col, t in morceaux:
+        for i, ch in enumerate(t):
+            grille[l][max(col, 0) + i] = ch
+
+    regle = "      " +"".join(str((i + decalage) // 10 % 10) if (i + decalage) % 10 == 0 else " " for i in range(largeur))
+    sortie = [regle.rstrip()]
+    for l in range(lignes_min, lignes_max + 1):
+        sortie.append(f"{l:>3} | " + "".join(grille[l]).rstrip())
+    return sortie
+
+
+# ------------------------------------------------------------------
+# Écriture des fichiers
+# ------------------------------------------------------------------
+def lignes_resume_s2i(capture):
+    lignes = construire_grille(capture["cellules"])
+    lignes += ["", "  Champs de saisie (EF) :"]
+    efs = sorted((c for c in capture["cellules"] if c["genre"] == "EF"), key=lambda c: (c["ligne"], c["col"]))
+    if not efs:
+        lignes.append("    (aucun)")
+    for c in efs:
+        infos = [f"max {c['longueur_max']}" if c["longueur_max"] else "", "lecture seule" if c["lecture_seule"] else "",
+                 "masqué" if not c["visible"] else ""]
+        infos = ", ".join(i for i in infos if i)
+        lignes.append(f"    {c['id']:<10} {c.get('libelle') or '(sans libellé)':<35} valeur='{c['texte']}'"
+                      + (f"   ({infos})" if infos else ""))
+    touches = [t for t in capture["touches"] if t["visible"] and t["texte"]]
+    if touches:
+        lignes += ["", "  Touches : " + " | ".join(f"{t['id']}={t['texte']}" for t in touches)]
+    return lignes
+
+
+def lignes_resume_cockpit(capture):
+    lignes = []
+    for c in capture["champs"]:
+        if c["genre"] == "section":
+            lignes += ["", f"  --- {c['titre']} ---"]
+        elif c["genre"] == "bouton":
+            lignes.append(f"    [bouton] {c['texte']}{'  (actif)' if c['actif'] else ''}   classes: {c['classes']}")
+        else:
+            etoile = " *" if c.get("obligatoire") and "*" not in (c.get("libelle") or "") else ""
+            details = [f"formcontrolname={c['formcontrolname'] or '-'}", f"{c['balise']}{('/' + c['type']) if c['type'] else ''}"]
+            if "coche" in c:
+                details.append("coché" if c["coche"] else "non coché")
+            if c.get("liste_deroulante"):
+                details.append(f"valeur='{c.get('valeur', '')}'")
+                details.append("croix ×" if c.get("croix_pour_vider") else "pas de croix")
+            elif "valeur" in c:
+                details.append(f"valeur={c['valeur']}")
+            if c.get("longueur_max"):
+                details.append(f"max {c['longueur_max']}")
+            lignes.append(f"    [champ] {c['libelle'] or '(sans libellé)'}{etoile}   " + " | ".join(details))
+            if isinstance(c.get("options"), list):
+                lignes.append(f"            options : {', '.join(o if o else '(vide)' for o in c['options'])}")
+            elif c.get("options"):
+                lignes.append(f"            options : {c['options']}")
+    return lignes
+
+
+def ecrire_fichiers(dossier, outil, ecran, captures):
+    os.makedirs(dossier, exist_ok=True)
+    entete = f"{outil}{(' - écran ' + ecran) if ecran else ''} - {datetime.now():%d/%m/%Y %H:%M}"
+    lignes = [entete, f"{len(captures)} capture(s)", ""]
+    for cap in captures:
+        lignes += ["", "=" * 100, f"Capture {cap['numero']:02d} - {cap['heure']} - {cap['titre']}", "=" * 100]
+        lignes += lignes_resume_s2i(cap) if outil == "S2i" else lignes_resume_cockpit(cap)
+        with open(os.path.join(dossier, f"page_{cap['numero']:02d}.html"), "w", encoding="utf-8") as f:
+            f.write(cap["html"])
+
+    with open(os.path.join(dossier, "captures.txt"), "w", encoding="utf-8") as f:
+        f.write("\n".join(lignes) + "\n")
+
+    sans_html = [{k: v for k, v in cap.items() if k != "html"} for cap in captures]
+    with open(os.path.join(dossier, "captures.json"), "w", encoding="utf-8") as f:
+        json.dump({"outil": outil, "ecran": ecran, "date": datetime.now().isoformat(timespec="seconds"),
+                   "captures": sans_html}, f, indent=2, ensure_ascii=False)
+
+
+# ------------------------------------------------------------------
+# Thread Playwright (Playwright sync et Tkinter ne partagent pas de thread)
+# ------------------------------------------------------------------
+class Arret(Exception):
+    """Levée quand l'utilisateur termine ou ferme Chrome pendant une attente."""
+
+
+class Robot(threading.Thread):
+    def __init__(self, outil, ecran, chemin_mdp, dossier_sortie, masquage, file_ui):
+        super().__init__(daemon=True)
+        self.outil = outil
+        self.ecran = ecran
+        self.chemin_mdp = chemin_mdp
+        self.masquage = masquage
+        self.file_ui = file_ui
+        self.commandes = queue.Queue()
+        self.captures = []
+        self.signatures = set()
+        self.page = None
+        horodatage = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.dossier = os.path.join(dossier_sortie, f"{outil}_{ecran + '_' if ecran else ''}{horodatage}")
+
+    # ---------- communication avec l'interface ----------
+    def emettre(self, genre, **donnees):
+        self.file_ui.put((genre, donnees))
+
+    def log(self, message, niveau="info"):
+        self.emettre("log", message=message, niveau=niveau)
+
+    def etape(self, index):
+        self.emettre("etape", index=index)
+
+    def pause(self, ms):
+        """Attente qui laisse Playwright traiter ses événements et détecte Chrome fermé."""
+        if self.page is None or self.page.is_closed():
+            raise Arret()
+        try:
+            self.page.wait_for_timeout(ms)
+        except Exception:
+            raise Arret()
+
+    def lire_commande(self):
+        try:
+            return self.commandes.get_nowait()
+        except queue.Empty:
+            return None
+
+    # ---------- déroulé ----------
+    def run(self):
+        try:
+            with sync_playwright() as p:
+                navigateur = p.chromium.launch(executable_path=CHROME_PATH, headless=False)
+                try:
+                    self.page = navigateur.new_context().new_page()
+                    self.page.set_default_timeout(15000)
+                    if self.outil == "S2i":
+                        self.page.set_viewport_size({"width": 1300, "height": 1250})
+                        self.deroule_s2i()
+                    else:
+                        self.page.set_viewport_size({"width": 1650, "height": 1000})
+                        self.deroule_cockpit()
+                except Arret:
+                    self.log("Session arrêtée (Chrome fermé ou Terminer).", "attention")
+                finally:
+                    self.finaliser()
+                    try:
+                        navigateur.close()
+                    except Exception:
+                        pass
+        except Exception as e:
+            self.log(f"Erreur : {e}", "erreur")
+            self.emettre("fini", dossier=None)
+
+    def finaliser(self):
+        if not self.captures:
+            self.log("Aucune capture : aucun fichier écrit.", "attention")
+            self.emettre("fini", dossier=None)
+            return
+        try:
+            ecrire_fichiers(self.dossier, self.outil, self.ecran, self.captures)
+            self.log(f"{len(self.captures)} capture(s) écrite(s) dans {self.dossier}", "ok")
+            self.emettre("fini", dossier=self.dossier)
+        except Exception as e:
+            self.log(f"Écriture des fichiers impossible : {e}", "erreur")
+            self.emettre("fini", dossier=None)
+
+    def boucle(self, capture_auto):
+        """Attend les commandes de l'interface ; en S2i, capture chaque nouvelle page stable."""
+        candidat, depuis = None, 0.0
+        while True:
+            commande = self.lire_commande()
+            if commande == "terminer":
+                return
+            if commande == "capture":
+                self.capturer()
+
+            if capture_auto:
+                signature = self.signature_s2i()
+                if signature:
+                    if signature != candidat:
+                        candidat, depuis = signature, time.monotonic()
+                    elif time.monotonic() - depuis >= STABLE_CAPTURE_S and signature not in self.signatures:
+                        self.capturer(signature)
+            self.pause(250)
+
+    def capturer(self, signature=None):
+        try:
+            if self.outil == "S2i":
+                self.capturer_s2i(signature)
+            else:
+                self.capturer_cockpit()
+        except Arret:
+            raise
+        except Exception as e:
+            self.log(f"Capture impossible : {e}", "erreur")
+
+    # ---------- S2i ----------
+    def frame(self):
+        return self.page.frame(name=FRAME_S2I)
+
+    def texte_frame(self):
+        f = self.frame()
+        if f is None:
+            return None
+        try:
+            return f.evaluate("() => document.body ? document.body.innerText : ''")
+        except Exception:
+            return None
+
+    def signature_s2i(self):
+        f = self.frame()
+        if f is None:
+            return None
+        try:
+            return f.evaluate(JS_S2I_SIGNATURE)
+        except Exception:
+            return None
+
+    def attendre_selecteur(self, selecteur, timeout_s):
+        fin = time.monotonic() + timeout_s
+        while time.monotonic() < fin:
+            f = self.frame()
+            if f is not None:
+                try:
+                    if f.locator(selecteur).first.is_visible():
+                        return f
+                except Exception:
+                    pass
+            self.pause(200)
+        raise TimeoutError(f"élément {selecteur} introuvable après {timeout_s} s")
+
+    def attendre_stable(self, stable_ms, timeout_s, different_de=None):
+        """Attend que le texte de l'écran ne bouge plus pendant stable_ms.
+        Si different_de est donné, il faut d'abord que l'écran ait changé."""
+        fin = time.monotonic() + timeout_s
+        dernier, depuis, a_change = None, time.monotonic(), different_de is None
+        while time.monotonic() < fin:
+            t = self.texte_frame()
+            if t is not None:
+                if not a_change and t != different_de:
+                    a_change = True
+                if t != dernier:
+                    dernier, depuis = t, time.monotonic()
+                elif a_change and (time.monotonic() - depuis) * 1000 >= stable_ms:
+                    return t
+            self.pause(150)
+        return None
+
+    def lire_identifiants(self):
+        import pandas as pd
+        valeurs = pd.read_excel(self.chemin_mdp).values.tolist()
+        return str(valeurs[0][0]).strip(), str(valeurs[0][1]).strip()
+
+    def taper_ecran(self):
+        self.page.keyboard.type(self.ecran, delay=DELAI_FRAPPE_MS)
+        self.pause(300)
+        self.page.keyboard.press("Enter")
+
+    def deroule_s2i(self):
+        # Étape 0 : connexion
+        self.etape(0)
+        utilisateur, mdp = self.lire_identifiants()
+        self.log(f"Connexion à S2i avec l'utilisateur {utilisateur}...")
+        self.page.goto(URL_S2I)
+        try:
+            self.page.wait_for_load_state("networkidle")
+        except Exception:
+            pass
+
+        f = self.attendre_selecteur("#EF_4_71", 30)
+        f.locator("#EF_4_71").fill(utilisateur)
+        f.locator("#EF_8_71").fill(mdp)
+        f.click("#entrerlib")
+
+        try:
+            f = self.attendre_selecteur('xpath=//*[@onclick="resetSession();"]', 8)
+            f.click('xpath=//*[@onclick="resetSession();"]')
+        except TimeoutError:
+            pass  # pas de session à réinitialiser
+
+        f = self.attendre_selecteur("#pf1", 20)
+        f.click("#pf1")
+        if self.attendre_stable(STABLE_LOGIN_MS, 20) is None:
+            self.log("Le menu S2i met du temps à se stabiliser, on continue.", "attention")
+        self.log("Connecté à S2i.", "ok")
+
+        # Étape 1 : ouverture de l'écran (retape, puis F4 + retape si rien ne bouge)
+        self.etape(1)
+        self.log(f"Ouverture de l'écran {self.ecran}...")
+        ouvert = None
+        for essai in range(3):
+            avant = self.texte_frame()
+            if essai == 2:
+                self.log("Rien ne bouge : retour au menu (F4) puis nouvel essai.", "attention")
+                self.page.keyboard.press("F4")
+                self.attendre_stable(STABLE_ECRAN_MS, 8)
+                avant = self.texte_frame()
+            elif essai == 1:
+                self.log("Code écran probablement perdu, nouvelle frappe.", "attention")
+            self.taper_ecran()
+            ouvert = self.attendre_stable(STABLE_ECRAN_MS, 10, different_de=avant)
+            if ouvert is not None:
+                break
+        if ouvert is None:
+            self.log(f"L'écran {self.ecran} ne s'est pas ouvert : ouvre-le à la main dans Chrome, "
+                     "la capture auto reste active.", "erreur")
+        elif self.ecran not in ouvert:
+            self.log(f"Écran ouvert, mais le code {self.ecran} n'apparaît pas à l'écran : vérifie dans Chrome.",
+                     "attention")
+        else:
+            self.log(f"Écran {self.ecran} ouvert.", "ok")
+
+        # Étape 2 : navigation libre, capture automatique
+        self.etape(2)
+        self.emettre("capture_dispo", actif=True)
+        self.log("Capture auto active : saisis la clé si besoin et passe les pages dans Chrome.")
+        self.boucle(capture_auto=True)
+        self.etape(3)
+
+    def capturer_s2i(self, signature=None):
+        f = self.frame()
+        if f is None:
+            self.log("Frame S2i introuvable, capture ignorée.", "attention")
+            return
+        donnees = f.evaluate(JS_S2I_INVENTAIRE, self.masquage)
+        cellules = donnees["cellules"]
+        if not cellules:
+            self.log("Aucun champ EF/ST sur cet écran, capture ignorée.", "attention")
+            return
+        deduire_libelles(cellules)
+        signature = signature or self.signature_s2i()
+        if signature:
+            self.signatures.add(signature)
+        capture = {
+            "numero": len(self.captures) + 1,
+            "heure": datetime.now().strftime("%H:%M:%S"),
+            "titre": titre_ecran(cellules),
+            "cellules": cellules,
+            "touches": donnees["touches"],
+            "html": donnees["html"],
+        }
+        self.captures.append(capture)
+        nb_ef = sum(1 for c in cellules if c["genre"] == "EF")
+        self.log(f"Capture {capture['numero']} : {capture['titre']} ({nb_ef} champ(s) EF)", "ok")
+        self.emettre("captures", nombre=len(self.captures))
+
+    # ---------- Cockpit ----------
+    def deroule_cockpit(self):
+        self.etape(0)
+        self.page.goto(URL_COCKPIT, wait_until="domcontentloaded")
+        self.log("Chrome ouvert sur Cockpit : connecte-toi.")
+        self.emettre("capture_dispo", actif=True)
+        self.etape(1)
+        self.boucle(capture_auto=False)
+        self.etape(3)
+
+    def capturer_cockpit(self):
+        resultat = self.page.evaluate(JS_COCKPIT_INVENTAIRE, TITRE_MODALE_COCKPIT)
+        if resultat.get("erreur"):
+            self.log(resultat["erreur"], "attention")
+            return
+        champs = resultat["champs"]
+        self.log(f"{sum(1 for c in champs if c['genre'] == 'champ')} champ(s) trouvé(s), lecture des listes...")
+        self.lire_options_cockpit(champs)
+        capture = {
+            "numero": len(self.captures) + 1,
+            "heure": datetime.now().strftime("%H:%M:%S"),
+            "titre": TITRE_MODALE_COCKPIT,
+            "champs": champs,
+            "html": resultat["html"],
+        }
+        self.captures.append(capture)
+        self.log(f"Capture {capture['numero']} enregistrée.", "ok")
+        self.emettre("captures", nombre=len(self.captures))
+        self.etape(2)
+
+    def lire_options_cockpit(self, champs):
+        """Ouvre chaque liste déroulante, lit ses options puis la referme (sans rien sélectionner)."""
+        for champ in champs:
+            if champ.get("genre") != "champ" or not champ.get("liste_deroulante") or not champ.get("formcontrolname"):
+                continue
+            nom = champ["formcontrolname"]
+            try:
+                liste = self.page.locator(f'[formcontrolname="{nom}"]').first
+                liste.scroll_into_view_if_needed()
+                liste.locator(".ng-select-container, .ng-arrow-wrapper").first.click()
+                self.pause(600)
+                options = self.page.locator(".ng-dropdown-panel .ng-option").all_inner_texts()
+                champ["options"] = [RE_CHIFFRES.sub(lambda m: "#" * len(m.group()), o.strip()) for o in options[:80]]
+                if len(options) > 80:
+                    champ["options"].append(f"... ({len(options)} options au total)")
+            except Arret:
+                raise
+            except Exception as e:
+                champ["options"] = f"lecture impossible : {e}"
+            finally:
+                try:
+                    self.page.keyboard.press("Escape")
+                    self.pause(300)
+                except Arret:
+                    raise
+                except Exception:
+                    pass
+
+
+# ------------------------------------------------------------------
+# Interface
+# ------------------------------------------------------------------
+ETAPES = {
+    "S2i": [
+        "Connexion automatique à S2i",
+        "Ouverture de l'écran {ecran}",
+        "Dans Chrome : saisis la clé si l'écran en demande une, puis passe les pages. "
+        "Chaque nouvelle page est capturée automatiquement (« Capturer » pour forcer).",
+        "Clique sur Terminer : les fichiers sont écrits et Chrome se ferme",
+    ],
+    "Cockpit": [
+        "Chrome s'ouvre sur Cockpit",
+        "Connecte-toi, sélectionne un portefeuille et ouvre la fenêtre à capturer "
+        "(ex. Statements > Portfolio), puis clique sur Capturer",
+        "Capture faite : tu peux en refaire une sur une autre fenêtre",
+        "Clique sur Terminer : les fichiers sont écrits et Chrome se ferme",
+    ],
+}
+
+COULEURS_LOG = {"info": ("gray20", "gray80"), "ok": ("#1f7a3f", "#5dd68a"),
+                "attention": ("#9a6700", "#f2c14e"), "erreur": ("#b42318", "#ff7b72")}
+BLEU = ("#1f5fbf", "#4c8dff")
+VERT = ("#1f7a3f", "#5dd68a")
+GRIS = ("gray55", "gray50")
+
+
+class Application(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        ctk.set_appearance_mode("system")
+        ctk.set_default_color_theme("blue")
+        self.title("Scraper d'écrans")
+        self.geometry("780x820")
+        self.minsize(680, 700)
+
+        self.file_ui = queue.Queue()
+        self.robot = None
+        self.dernier_dossier = None
+        self.fermer_apres = False
+        self.config_sauvee = self.charger_config()
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(4, weight=1)
+
+        self.construire_entete()
+        self.construire_parametres()
+        self.construire_consignes()
+        self.construire_actions()
+        self.construire_journal()
+
+        self.changer_outil(self.var_outil.get())
+        self.protocol("WM_DELETE_WINDOW", self.fermer)
+        self.after(100, self.lire_file_ui)
+
+    # ---------- construction ----------
+    def construire_entete(self):
+        cadre = ctk.CTkFrame(self, fg_color="transparent")
+        cadre.grid(row=0, column=0, sticky="ew", padx=20, pady=(18, 6))
+        ctk.CTkLabel(cadre, text="Scraper d'écrans", font=ctk.CTkFont(size=22, weight="bold")).pack(anchor="w")
+        ctk.CTkLabel(cadre, text="Extrait la structure d'un écran S2i ou Cockpit (champs, libellés, HTML)",
+                     text_color=GRIS).pack(anchor="w")
+
+    def construire_parametres(self):
+        carte = ctk.CTkFrame(self, corner_radius=12)
+        carte.grid(row=1, column=0, sticky="ew", padx=20, pady=6)
+        carte.grid_columnconfigure(1, weight=1)
+        self.carte_param = carte
+
+        ctk.CTkLabel(carte, text="Outil").grid(row=0, column=0, sticky="w", padx=(16, 10), pady=(14, 6))
+        self.var_outil = ctk.StringVar(value=self.config_sauvee.get("outil", "S2i"))
+        self.menu_outil = ctk.CTkOptionMenu(carte, values=["S2i", "Cockpit"], variable=self.var_outil,
+                                            command=self.changer_outil, width=160)
+        self.menu_outil.grid(row=0, column=1, sticky="w", pady=(14, 6))
+
+        self.lbl_ecran = ctk.CTkLabel(carte, text="Écran")
+        self.lbl_ecran.grid(row=1, column=0, sticky="w", padx=(16, 10), pady=6)
+        self.entree_ecran = ctk.CTkEntry(carte, placeholder_text="ex. OVAL", width=160)
+        self.entree_ecran.grid(row=1, column=1, sticky="w", pady=6)
+        if self.config_sauvee.get("ecran"):
+            self.entree_ecran.insert(0, self.config_sauvee["ecran"])
+        self.entree_ecran.bind("<Return>", lambda _e: self.lancer())
+
+        self.lbl_user = ctk.CTkLabel(carte, text="User S2i")
+        self.lbl_user.grid(row=2, column=0, sticky="w", padx=(16, 10), pady=6)
+        self.cadre_user = ctk.CTkFrame(carte, fg_color="transparent")
+        self.cadre_user.grid(row=2, column=1, sticky="ew", padx=(0, 16), pady=6)
+        self.var_user = ctk.StringVar(value=self.config_sauvee.get("user", UTILISATEURS[0]))
+        self.combo_user = ctk.CTkComboBox(self.cadre_user, values=UTILISATEURS, variable=self.var_user,
+                                          width=160, command=lambda _v: self.maj_chemin_mdp())
+        self.combo_user.pack(side="left")
+        self.lbl_chemin_mdp = ctk.CTkLabel(self.cadre_user, text="", text_color=GRIS)
+        self.lbl_chemin_mdp.pack(side="left", padx=10)
+        self.var_user.trace_add("write", lambda *_: self.maj_chemin_mdp())
+        self.maj_chemin_mdp()
+
+        ctk.CTkLabel(carte, text="Dossier de sortie").grid(row=3, column=0, sticky="w", padx=(16, 10), pady=6)
+        _, self.entree_sortie = self.champ_chemin(
+            carte, 3, self.config_sauvee.get("sortie", DOSSIER_SORTIE_DEFAUT), dossier=True)
+
+        self.var_masquage = ctk.BooleanVar(value=self.config_sauvee.get("masquage", True))
+        ctk.CTkCheckBox(carte, text="Masquer ISIN et suites de 5 chiffres ou plus",
+                        variable=self.var_masquage).grid(row=4, column=1, sticky="w", pady=(6, 14))
+
+    def user_s2i(self):
+        return self.var_user.get().strip().upper()
+
+    def maj_chemin_mdp(self):
+        user = self.user_s2i()
+        if not user:
+            self.lbl_chemin_mdp.configure(text="")
+            return
+        trouve = os.path.isfile(chemin_mdp(user))
+        self.lbl_chemin_mdp.configure(text=f"mdp{user}.xlsx" + ("" if trouve else "  (introuvable)"),
+                                      text_color=GRIS if trouve else COULEURS_LOG["erreur"])
+
+    def champ_chemin(self, parent, ligne, valeur, dossier):
+        cadre = ctk.CTkFrame(parent, fg_color="transparent")
+        cadre.grid(row=ligne, column=1, sticky="ew", padx=(0, 16), pady=6)
+        cadre.grid_columnconfigure(0, weight=1)
+        entree = ctk.CTkEntry(cadre)
+        entree.grid(row=0, column=0, sticky="ew")
+        entree.insert(0, valeur)
+
+        def parcourir():
+            if dossier:
+                choix = filedialog.askdirectory(initialdir=entree.get() or DOSSIER_SCRIPT)
+            else:
+                choix = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx")],
+                                                   initialdir=os.path.dirname(entree.get()) or DOSSIER_SCRIPT)
+            if choix:
+                entree.delete(0, "end")
+                entree.insert(0, os.path.normpath(choix))
+
+        ctk.CTkButton(cadre, text="…", width=36, command=parcourir).grid(row=0, column=1, padx=(6, 0))
+        return cadre, entree
+
+    def construire_consignes(self):
+        carte = ctk.CTkFrame(self, corner_radius=12)
+        carte.grid(row=2, column=0, sticky="ew", padx=20, pady=6)
+        carte.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(carte, text="Consignes", font=ctk.CTkFont(size=15, weight="bold")).grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=16, pady=(12, 4))
+        self.puces, self.textes_etapes = [], []
+        for i in range(4):
+            puce = ctk.CTkLabel(carte, text="○", width=24, font=ctk.CTkFont(size=15), text_color=GRIS)
+            puce.grid(row=i + 1, column=0, sticky="nw", padx=(16, 4), pady=3)
+            texte = ctk.CTkLabel(carte, text="", justify="left", anchor="w", wraplength=640, text_color=GRIS)
+            texte.grid(row=i + 1, column=1, sticky="ew", padx=(0, 16), pady=3)
+            self.puces.append(puce)
+            self.textes_etapes.append(texte)
+        ctk.CTkFrame(carte, height=8, fg_color="transparent").grid(row=6, column=0)
+
+    def construire_actions(self):
+        cadre = ctk.CTkFrame(self, fg_color="transparent")
+        cadre.grid(row=3, column=0, sticky="ew", padx=20, pady=6)
+        self.btn_lancer = ctk.CTkButton(cadre, text="Lancer", width=120, command=self.lancer,
+                                        font=ctk.CTkFont(weight="bold"))
+        self.btn_lancer.pack(side="left")
+        self.btn_capturer = ctk.CTkButton(cadre, text="Capturer", width=110, command=self.capturer,
+                                          fg_color="transparent", border_width=1, text_color=("gray10", "gray90"))
+        self.btn_capturer.pack(side="left", padx=8)
+        self.btn_terminer = ctk.CTkButton(cadre, text="Terminer", width=110, command=self.terminer,
+                                          fg_color=("#b42318", "#c4322a"), hover_color=("#8f1c13", "#9e271f"))
+        self.btn_terminer.pack(side="left")
+        self.btn_dossier = ctk.CTkButton(cadre, text="Ouvrir le dossier", width=140, command=self.ouvrir_dossier,
+                                         fg_color="transparent", border_width=1, text_color=("gray10", "gray90"))
+        self.btn_dossier.pack(side="right")
+        self.lbl_compteur = ctk.CTkLabel(cadre, text="0 capture", text_color=GRIS)
+        self.lbl_compteur.pack(side="right", padx=12)
+        self.etat_boutons(en_cours=False)
+
+    def construire_journal(self):
+        self.journal = ctk.CTkTextbox(self, corner_radius=12, font=ctk.CTkFont(family="Consolas", size=12),
+                                      state="disabled", wrap="word")
+        self.journal.grid(row=4, column=0, sticky="nsew", padx=20, pady=(6, 18))
+        for niveau, couleur in COULEURS_LOG.items():
+            mode = 1 if ctk.get_appearance_mode() == "Dark" else 0
+            self.journal.tag_config(niveau, foreground=couleur[mode])
+
+    # ---------- état de l'interface ----------
+    def changer_outil(self, outil):
+        s2i = outil == "S2i"
+        for widget in (self.lbl_ecran, self.entree_ecran, self.lbl_user, self.cadre_user):
+            widget.grid() if s2i else widget.grid_remove()
+        self.afficher_etapes(-1)
+
+    def afficher_etapes(self, courante):
+        outil = self.var_outil.get()
+        ecran = self.entree_ecran.get().strip().upper() or "demandé"
+        for i, (puce, texte) in enumerate(zip(self.puces, self.textes_etapes)):
+            libelle = ETAPES[outil][i].format(ecran=ecran)
+            if i < courante:
+                puce.configure(text="✓", text_color=VERT)
+                texte.configure(text=libelle, text_color=GRIS, font=ctk.CTkFont())
+            elif i == courante:
+                puce.configure(text="●", text_color=BLEU)
+                texte.configure(text=libelle, text_color=("gray10", "gray95"), font=ctk.CTkFont(weight="bold"))
+            else:
+                puce.configure(text="○", text_color=GRIS)
+                texte.configure(text=libelle, text_color=("gray30", "gray75"), font=ctk.CTkFont())
+
+    def etat_boutons(self, en_cours, capture_dispo=False):
+        self.btn_lancer.configure(state="disabled" if en_cours else "normal")
+        self.menu_outil.configure(state="disabled" if en_cours else "normal")
+        self.btn_capturer.configure(state="normal" if (en_cours and capture_dispo) else "disabled")
+        self.btn_terminer.configure(state="normal" if en_cours else "disabled")
+        self.btn_dossier.configure(state="normal" if self.dernier_dossier else "disabled")
+
+    def ecrire_log(self, message, niveau="info"):
+        self.journal.configure(state="normal")
+        self.journal.insert("end", f"[{datetime.now():%H:%M:%S}] {message}\n", niveau)
+        self.journal.see("end")
+        self.journal.configure(state="disabled")
+
+    # ---------- actions ----------
+    def lancer(self):
+        if self.robot and self.robot.is_alive():
+            return
+        outil = self.var_outil.get()
+        ecran = self.entree_ecran.get().strip().upper() if outil == "S2i" else ""
+        if outil == "S2i":
+            if not re.fullmatch(r"[A-Z0-9]{2,8}", ecran):
+                messagebox.showwarning("Écran", "Indique un code écran S2i (ex. OVAL, IOVT, RRTI).")
+                return
+            user = self.user_s2i()
+            if not user or not os.path.isfile(chemin_mdp(user)):
+                messagebox.showwarning("User S2i", f"Fichier d'identifiants introuvable :\n{chemin_mdp(user)}")
+                return
+        if not self.entree_sortie.get().strip():
+            messagebox.showwarning("Dossier de sortie", "Choisis un dossier de sortie.")
+            return
+        self.entree_ecran.delete(0, "end")
+        self.entree_ecran.insert(0, ecran)
+        self.sauver_config()
+
+        self.journal.configure(state="normal")
+        self.journal.delete("1.0", "end")
+        self.journal.configure(state="disabled")
+        self.lbl_compteur.configure(text="0 capture")
+        self.afficher_etapes(0)
+
+        self.robot = Robot(outil, ecran, chemin_mdp(self.user_s2i()), self.entree_sortie.get().strip(),
+                           self.var_masquage.get(), self.file_ui)
+        self.robot.start()
+        self.etat_boutons(en_cours=True)
+        self.ecrire_log(f"Lancement {outil}{(' - ' + ecran) if ecran else ''}...")
+
+    def capturer(self):
+        if self.robot and self.robot.is_alive():
+            self.robot.commandes.put("capture")
+
+    def terminer(self):
+        if self.robot and self.robot.is_alive():
+            self.robot.commandes.put("terminer")
+            self.btn_terminer.configure(state="disabled")
+            self.btn_capturer.configure(state="disabled")
+            self.ecrire_log("Fin demandée, écriture des fichiers...")
+
+    def ouvrir_dossier(self):
+        if self.dernier_dossier and os.path.isdir(self.dernier_dossier):
+            os.startfile(self.dernier_dossier)
+
+    def fermer(self):
+        if self.robot and self.robot.is_alive():
+            if not messagebox.askyesno("Capture en cours", "Écrire les captures et fermer ?"):
+                return
+            self.fermer_apres = True
+            self.terminer()
+            return
+        self.destroy()
+
+    def lire_file_ui(self):
+        try:
+            while True:
+                genre, d = self.file_ui.get_nowait()
+                if genre == "log":
+                    self.ecrire_log(d["message"], d["niveau"])
+                elif genre == "etape":
+                    self.afficher_etapes(d["index"])
+                elif genre == "captures":
+                    n = d["nombre"]
+                    self.lbl_compteur.configure(text=f"{n} capture{'s' if n > 1 else ''}")
+                elif genre == "capture_dispo":
+                    self.etat_boutons(en_cours=True, capture_dispo=d["actif"])
+                elif genre == "fini":
+                    if d["dossier"]:
+                        self.dernier_dossier = d["dossier"]
+                        self.afficher_etapes(4)
+                    self.etat_boutons(en_cours=False)
+                    if self.fermer_apres:
+                        self.destroy()
+                        return
+        except queue.Empty:
+            pass
+        self.after(100, self.lire_file_ui)
+
+    # ---------- configuration ----------
+    def charger_config(self):
+        try:
+            with open(CHEMIN_CONFIG, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def sauver_config(self):
+        config = {"outil": self.var_outil.get(), "ecran": self.entree_ecran.get().strip().upper(),
+                  "user": self.user_s2i(), "sortie": self.entree_sortie.get().strip(),
+                  "masquage": self.var_masquage.get()}
+        try:
+            with open(CHEMIN_CONFIG, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    Application().mainloop()
