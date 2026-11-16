@@ -3469,7 +3469,7 @@ def ouvrir_interface():
     date_entry = DateEntry(
         champ_date,
         style="Cockpit.DateEntry",
-        date_pattern="dd.mm.yyyy",
+        date_pattern="yyyy-mm-dd",
         width=14,
         font=police_date(),
         background=UI_PRIMARY,
