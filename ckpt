@@ -47,7 +47,7 @@ DEFAULT_GUI_VALUES = {
     "Performance_type": "MWR",
     "Est_currency": "EUR",
     "Language": "FRENCH",
-    "Monthly_perf_history": "2025-07",
+    "Monthly_perf_history": "",  # renseigné plus bas : le plus ancien mois de LISTE_MONTHLY
     "Annual_perf_history": "2012",
     "Anonymized_document": False,
     "Client_signature": False,
@@ -78,34 +78,30 @@ INTERVALLE_NOTIFS_SEC = 3
 TIMEOUT_NOTIFS_MIN = 30
 
 
+# Cockpit propose une fenêtre glissante de 15 mois, du mois précédent au plus ancien
+# (ex. le 05/11/2026 : 2026-10 ... 2025-08), le plus ancien étant sa valeur par défaut.
+NB_MOIS_MONTHLY = 15
+
+
 def generer_liste_monthly():
     aujourd_hui = datetime.today()
 
-    annee_debut = aujourd_hui.year - 1
-    mois_debut = 1
-
-    if aujourd_hui.month == 1:
-        annee_fin = aujourd_hui.year - 1
-        mois_fin = 12
-    else:
-        annee_fin = aujourd_hui.year
-        mois_fin = aujourd_hui.month - 1
+    # mois précédent
+    annee, mois = (aujourd_hui.year - 1, 12) if aujourd_hui.month == 1 else (aujourd_hui.year, aujourd_hui.month - 1)
 
     resultat = []
-    annee = annee_debut
-    mois = mois_debut
-
-    while (annee < annee_fin) or (annee == annee_fin and mois <= mois_fin):
+    for _ in range(NB_MOIS_MONTHLY):
         resultat.append(f"{annee}-{mois:02d}")
-        mois += 1
-        if mois == 13:
-            mois = 1
-            annee += 1
+        mois -= 1
+        if mois == 0:
+            mois = 12
+            annee -= 1
 
-    return list(reversed(resultat))
+    return resultat
 
 
 LISTE_MONTHLY = generer_liste_monthly()
+DEFAULT_GUI_VALUES["Monthly_perf_history"] = LISTE_MONTHLY[-1]  # valeur par défaut de Cockpit
 LISTE_ANNUAL = [str(y) for y in range(2012, datetime.today().year + 1)]
 
 # Libellé affiché dans l'interface pour un champ facultatif laissé vide dans Cockpit
@@ -2811,7 +2807,16 @@ def ouvrir_interface():
         var_signature.set(bool(params.get("signature", DEFAULT_GUI_VALUES["Client_signature"])))
         var_perf.set(str(params.get("performance_type", DEFAULT_GUI_VALUES["Performance_type"])).strip() or DEFAULT_GUI_VALUES["Performance_type"])
         # Champs facultatifs : une valeur vide enregistrée reste vide
-        var_monthly.set(afficher_liste(params.get("monthly_perf_history", DEFAULT_GUI_VALUES["Monthly_perf_history"])))
+        mois = str(params.get("monthly_perf_history", DEFAULT_GUI_VALUES["Monthly_perf_history"]) or "").strip()
+        if mois and mois not in LISTE_MONTHLY:
+            # Mois sorti de la fenêtre glissante de Cockpit : remplacé par le plus ancien disponible
+            messagebox.showinfo(
+                "Monthly performance history",
+                f"Le mois {mois} n'est plus proposé par Cockpit.\n"
+                f"Il est remplacé par {LISTE_MONTHLY[-1]} (le plus ancien disponible)."
+            )
+            mois = LISTE_MONTHLY[-1]
+        var_monthly.set(afficher_liste(mois))
         var_annual.set(afficher_liste(params.get("annual_perf_history", DEFAULT_GUI_VALUES["Annual_perf_history"])))
         etat_avances["valeur"] = normaliser_avances(params.get("avances"))
         rafraichir_resume_avances()
