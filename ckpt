@@ -476,12 +476,16 @@ def clean_n_intv(value):
     return digits.zfill(7)
 
 
+# Format de la date saisie dans le champ VALUATION DATE de Cockpit
+FORMAT_DATE_COCKPIT = "%Y-%m-%d"
+
+
 def normaliser_date(value):
     if pd.isna(value):
         return None
 
     if isinstance(value, (datetime, pd.Timestamp)):
-        return value.strftime("%d.%m.%Y")
+        return value.strftime(FORMAT_DATE_COCKPIT)
 
     texte = str(value).strip()
     if not texte:
@@ -490,7 +494,7 @@ def normaliser_date(value):
     for fmt in ("%d.%m.%Y", "%d/%m/%Y", "%Y-%m-%d", "%d%m%Y"):
         try:
             dt = datetime.strptime(texte, fmt)
-            return dt.strftime("%d.%m.%Y")
+            return dt.strftime(FORMAT_DATE_COCKPIT)
         except ValueError:
             pass
 
@@ -498,7 +502,7 @@ def normaliser_date(value):
     if pd.isna(dt):
         raise ValueError(f"Date invalide : {value}")
 
-    return dt.strftime("%d.%m.%Y")
+    return dt.strftime(FORMAT_DATE_COCKPIT)
 
 
 def normaliser_statement_type(value):
