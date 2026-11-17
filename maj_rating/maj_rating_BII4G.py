@@ -1,0 +1,696 @@
+from pathlib import Path
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+import pandas as pd
+import time
+import re
+from datetime import datetime
+import os
+import sys
+import zlib  # [MODIF] répartition stable des codes entre robots
+
+# =========================
+# Paramètres
+# =========================
+CHEMIN_INPUT = r"C:\Users\ut34e9\Desktop\Python\maj_rating\output_obligations_rating.xlsx"
+AUDIT_DIR = r"C:\Users\ut34e9\Desktop\Python\maj_rating\Audit"
+DOSSIER_MDP = r"P:\CPSI_CONTROL_DATA\SAS_DATA\000_Parametres_Documents"
+URL_S2I = "https://s2i-frontindprd.ch.pbk/caiportal/index2.html"
+
+# =========================
+# [MODIF] Multi-robots : la SEULE ligne à changer entre les deux copies du script
+# =========================
+ROBOT_ID = 2      # 1 = BIMTE, 2 = BII4G
+NB_ROBOTS = 2     # mettre 1 pour faire tourner un seul robot sur toute la liste
+
+ROBOTS = {
+    # robot 1 garde les fichiers audit historiques (pas de suffixe)
+    1: {"user": "BIMTE", "mdp": os.path.join(DOSSIER_MDP, "mdpBIMTE.xlsx"), "suffixe": ""},
+    # 2: {"user": "BIVKG", "mdp": os.path.join(DOSSIER_MDP, "mdpBIVKG.xlsx"), "suffixe": "_BIVKG"},
+    2: {"user": "BII4G", "mdp": os.path.join(DOSSIER_MDP, "mdpBII4G.xlsx"), "suffixe": "_BII4G"},
+}
+ROBOT = ROBOTS[ROBOT_ID]
+CHEMIN_MDP = ROBOT["mdp"]
+
+# chaque robot écrit UNIQUEMENT dans ses propres fichiers audit
+audit_ok_path = os.path.join(AUDIT_DIR, f"audit_oval_bds{ROBOT['suffixe']}.xlsx")
+audit_err_path = os.path.join(AUDIT_DIR, f"audit_error_oval_bds{ROBOT['suffixe']}.xlsx")
+
+# --- attentes dynamiques ---
+ATTENTE_MAX_S = 15
+STABLE_S = 0.3
+PAUSE_AVANT_TOUCHE = 0.05
+POLL_MS = 50
+SEUIL_TOUCHE_LENTE_S = 3       # [MODIF] log si une touche prend plus que ça
+
+# --- robustesse ---
+TENTATIVES_VALEUR = 3
+SAUVEGARDE_TOUS_LES = 5        # [MODIF] avant : 2 écritures Excel après chaque code
+REDEMARRAGE_TOUS_LES = 40      # [MODIF] relance Chrome tous les N codes (mémoire) — 0 = désactivé
+MAX_RECONNEXIONS = 15          # [MODIF] au-delà, le robot s'arrête proprement
+
+MESSAGE_SUCCES = "MUTATION BIEN EFFECTUEE"
+CODE_QUITTANCE = "E1170 - MESSAGE(S) A QUITTANCER - PRESSEZ PF2"
+ANNEE = str(datetime.now().year)   # [MODIF] remplace le "2026" en dur (page 6)
+
+# Périodes de coupon : p1..p4 au format jj.mm, coupon_frequency de 1 à 4
+COL_FREQ = 'coupon_frequency'
+COLS_PERIODES = ['p1', 'p2', 'p3', 'p4']
+CHAMPS_PERIODES = [
+    ("#EF_20_8", "#EF_21_8"),
+    ("#EF_20_14", "#EF_21_14"),
+    ("#EF_20_20", "#EF_21_20"),
+    ("#EF_20_26", "#EF_21_26")
+]
+
+# =========================
+# Utils de base
+# =========================
+def log(message):
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {str(message).encode('ascii', 'replace').decode()}")
+
+def en_texte(v):
+    if pd.isna(v):
+        return ''
+    if hasattr(v, 'strftime'):
+        return v.strftime('%d.%m')
+    return str(v).strip()
+
+def en_periode(v):
+    """Remet une période au format jj.mm, même si Excel l'a stockée en nombre."""
+    s = en_texte(v)
+    if not s:
+        return ''
+    m = re.fullmatch(r"(\d{1,2})[.,](\d{1,2})", s)
+    if not m:
+        return s
+    jour, mois = m.group(1), m.group(2)
+    if len(mois) == 1:
+        mois += '0'
+    return f"{int(jour):02d}.{mois}"
+
+def v2s(v):
+    """Valeur -> texte pour S2I ; NaN/None -> '' (évite de saisir 'nan')."""
+    return "" if pd.isna(v) else str(v).strip()
+
+# =========================
+# Préparation audits
+# =========================
+os.makedirs(AUDIT_DIR, exist_ok=True)
+
+for path in [audit_ok_path, audit_err_path]:
+    if not os.path.exists(path):
+        pd.DataFrame(columns=["Security_S2I", "Log"]).to_excel(path, index=False)
+
+# Vérifie si un des fichiers audit du robot est ouvert
+for path in [audit_ok_path, audit_err_path]:
+    try:
+        with open(path, 'a'):
+            pass
+    except PermissionError:
+        print(f"Le fichier audit est ouvert : {path}\nVeuillez le fermer avant de lancer le script.")
+        sys.exit(1)
+
+# =========================
+# Chargement de la liste à traiter
+# =========================
+df_isin = pd.read_excel(CHEMIN_INPUT)
+
+# [MODIF] codes vides / "nan" ignorés, doublons supprimés
+df_isin = df_isin[df_isin.iloc[:, 0].notna()].copy()
+df_isin.iloc[:, 0] = df_isin.iloc[:, 0].astype(str).str.strip()
+df_isin = df_isin[(df_isin.iloc[:, 0] != "") & (df_isin.iloc[:, 0].str.lower() != "nan")]
+df_isin = df_isin.drop_duplicates(subset=df_isin.columns[0], keep="first")
+
+for col in COLS_PERIODES:
+    df_isin[col] = df_isin[col].apply(en_periode)
+
+df_isin[COL_FREQ] = df_isin[COL_FREQ].apply(en_texte)
+df_isin[COL_FREQ] = df_isin[COL_FREQ].str.replace(r'\.0$', '', regex=True)
+
+IDX_FREQ = df_isin.columns.get_loc(COL_FREQ)
+IDX_PERIODES = [df_isin.columns.get_loc(c) for c in COLS_PERIODES]
+
+liste_isin = list(df_isin.values.tolist())
+
+# [MODIF] répartition des codes entre robots : chaque code va toujours au même robot
+def robot_du_code(code):
+    return zlib.crc32(str(code).strip().encode()) % NB_ROBOTS + 1
+
+liste_isin = [row for row in liste_isin if robot_du_code(row[0]) == ROBOT_ID]
+print(f"Robot {ROBOT_ID} ({ROBOT['user']}) : {len(liste_isin)} code(s) dans sa liste")
+
+# =========================
+# Chargement des audits
+# =========================
+def lire_audit(path, tentatives=5):
+    # [MODIF] l'audit de l'autre robot peut être en cours d'écriture
+    for _ in range(tentatives):
+        try:
+            df = pd.read_excel(path)
+            if "Security_S2I" in df.columns:
+                df["Security_S2I"] = df["Security_S2I"].astype(str).str.strip()
+            return df
+        except Exception:
+            time.sleep(2)
+    print(f"[warn] audit illisible, ignoré : {path}")
+    return pd.DataFrame(columns=["Security_S2I", "Log"])
+
+df_audit_ok = lire_audit(audit_ok_path)
+df_audit_err = lire_audit(audit_err_path)
+
+# [MODIF] codes déjà faits = audits OK de TOUS les robots (lecture seule pour ceux des autres)
+codes_deja_traite = set(df_audit_ok["Security_S2I"])
+for p in Path(AUDIT_DIR).glob("audit_oval_bds*.xlsx"):
+    if p.name.startswith("~$") or os.path.normcase(str(p)) == os.path.normcase(audit_ok_path):
+        continue
+    codes_deja_traite |= set(lire_audit(p)["Security_S2I"])
+
+reste = [row for row in liste_isin if str(row[0]).strip() not in codes_deja_traite]
+print(f"Robot {ROBOT_ID} : {len(reste)} code(s) restant(s) à traiter")
+
+# =========================
+# Identifiants S2I
+# =========================
+mdp = pd.read_excel(CHEMIN_MDP)
+mdp = list(mdp.values.tolist())
+username = mdp[0][0]
+password = mdp[0][1]
+
+# =========================
+# Détection crash / attentes
+# =========================
+class PageCrash(Exception):
+    pass
+
+ETAT = {"crash": False}
+
+def verifier_crash():
+    if ETAT["crash"]:
+        raise PageCrash("Page S2i plantée (crash Chrome / Out of Memory)")
+
+def est_crash(e):
+    txt = str(e).lower()
+    return (ETAT["crash"] or isinstance(e, PageCrash)
+            or any(m in txt for m in ("crash", "target closed", "has been closed", "out of memory")))
+
+def est_timeout(e):
+    """Erreur 'champ/écran pas encore là' -> on peut retenter."""
+    msg = str(e).lower()
+    return isinstance(e, PWTimeout) or "waiting for locator" in msg or "introuvable" in msg or "timeout" in msg
+
+def attendre_frame(page, nom, selecteur, tentatives=30):
+    """Attend que la frame 'nom' existe ET affiche 'selecteur'."""
+    for _ in range(tentatives):
+        verifier_crash()
+        frame = page.frame(name=nom)
+        if frame:
+            try:
+                frame.wait_for_selector(selecteur, state="visible", timeout=2000)
+                return frame
+            except Exception:
+                pass
+        page.wait_for_timeout(1000)
+    raise RuntimeError(f"Frame '{nom}' / élément '{selecteur}' introuvable après {tentatives} tentatives")
+
+JS_SIGNATURE = """() => {
+    const b = document.body;
+    if (!b) return '';
+    const h = b.innerHTML;
+    let x = 0;
+    for (let i = 0; i < h.length; i++) x = (x * 31 + h.charCodeAt(i)) | 0;
+    return h.length + ':' + x;
+}"""
+
+def signature_ecran(page):
+    try:
+        f = page.frame("crysalid0")
+        return f.evaluate(JS_SIGNATURE) if f else None
+    except Exception:
+        return None
+
+def touche(page, key, attente_max=ATTENTE_MAX_S):
+    """Appuie sur une touche puis attend que S2I ait répondu et que l'écran soit stable."""
+    verifier_crash()
+    time.sleep(PAUSE_AVANT_TOUCHE)
+    avant = signature_ecran(page)
+    page.keyboard.press(key)
+
+    debut = time.time()
+    courant = avant
+    while time.time() - debut < attente_max:
+        verifier_crash()
+        page.wait_for_timeout(POLL_MS)
+        courant = signature_ecran(page)
+        if courant is not None and courant != avant:
+            break
+    else:
+        log(f"  [info] écran inchangé {attente_max}s après {key}")
+        return False
+
+    stable_depuis = time.time()
+    while time.time() - debut < attente_max + 5:
+        verifier_crash()
+        page.wait_for_timeout(POLL_MS)
+        s = signature_ecran(page)
+        if s != courant:
+            courant = s
+            stable_depuis = time.time()
+        elif time.time() - stable_depuis >= STABLE_S:
+            break
+
+    duree = time.time() - debut
+    if duree > SEUIL_TOUCHE_LENTE_S:
+        log(f"  [lent] {key} : {duree:.1f}s")
+    return True
+
+def taper_ecran(page, code):
+    page.keyboard.type(code)
+    return touche(page, 'Enter')
+
+def fill_avec_retry(frame, page, selecteur, valeur, tentatives=3, timeout_ms=5000):
+    """Attend que le champ soit visible avant de le remplir."""
+    derniere_erreur = None
+    for essai in range(1, tentatives + 1):
+        verifier_crash()
+        try:
+            loc = frame.locator(selecteur)
+            loc.wait_for(state="visible", timeout=timeout_ms)
+            loc.fill(v2s(valeur))
+            return
+        except Exception as e:
+            derniere_erreur = e
+            if page.is_closed() or est_crash(e):
+                raise
+            log(f"  [retry {essai}/{tentatives}] {selecteur} pas encore prêt")
+            page.wait_for_timeout(300)
+    raise derniere_erreur
+
+def remplir_si_vide(frame, page, champ_note, champ_date, note, date_note, nom):
+    """[MODIF] Remplit une note (et sa date) seulement si le champ S2i est vide."""
+    note = v2s(note)
+    loc = frame.locator(champ_note)
+    loc.wait_for(state="visible", timeout=5000)
+    actuel = loc.input_value().strip()
+    if actuel:
+        log(f"  {nom} déjà renseigné dans S2i ('{actuel}') : inchangé")
+        return
+    if not note:
+        log(f"  {nom} vide dans S2i et dans l'input : rien à saisir")
+        return
+    loc.fill(note)
+    frame.locator(champ_date).fill(v2s(date_note))
+    log(f"  {nom} vide dans S2i -> saisi '{note}'")
+
+def lire_message_final(frame, timeout_s=10, stable_s=1.5):
+    """[MODIF] Sortie immédiate sur succès/E1170, sinon on attend un message stable
+    (avant : le 1er message non vide était pris, même s'il était intermédiaire)."""
+    fin = time.time() + timeout_s
+    message, dernier, depuis = "", None, time.time()
+    while time.time() < fin:
+        verifier_crash()
+        try:
+            message = frame.locator("#s2imsgElt").inner_text(timeout=1000).strip()
+        except Exception:
+            message = ""
+        up = message.upper()
+        if MESSAGE_SUCCES in up or CODE_QUITTANCE in up:
+            return message
+        if message and message == dernier:
+            if time.time() - depuis >= stable_s:
+                return message
+        else:
+            dernier, depuis = message, time.time()
+        time.sleep(0.1)
+    return message
+
+def periodes_coupon(row):
+    """Renvoie [p1] si fréquence 1, [p1, p2] si 2, etc."""
+    freq = row[IDX_FREQ]
+    if freq not in ('1', '2', '3', '4'):
+        raise ValueError(f"coupon_frequency invalide : '{freq}' (attendu 1 à 4)")
+    periodes = [row[i] for i in IDX_PERIODES[:int(freq)]]
+    for nom, p in zip(COLS_PERIODES, periodes):
+        m = re.fullmatch(r"(\d{2})\.(\d{2})", p)
+        if not m or not (1 <= int(m.group(1)) <= 31 and 1 <= int(m.group(2)) <= 12):
+            raise ValueError(f"{nom} invalide : '{p}' (attendu jj.mm)")
+    return periodes
+
+def double_f4(page):
+    # [MODIF] protégé : une erreur ici ne doit jamais masquer l'erreur d'origine
+    for _ in range(2):
+        try:
+            if page.is_closed():
+                return
+            touche(page, 'F4', attente_max=5)
+        except Exception as e:
+            log(f"  [warn] F4 impossible : {e}")
+            return
+
+def ouvrir_oval(page, security_s2i, fitchs_rating, fitchs_rating_date):
+    """OVAL -> valeur -> F11 x2 -> rating Fitch (si vide) -> F4.
+    Renvoie la frame à jour (évite une référence périmée)."""
+    taper_ecran(page, "OVAL")
+    frame = attendre_frame(page, "crysalid0", "#EF_5_14", tentatives=8)
+    frame.locator("#EF_5_14").fill(security_s2i)
+    touche(page, 'Enter')
+
+    touche(page, 'F11')
+    touche(page, 'F11')
+
+    # [MODIF] Fitch : même règle que S&P / Moody's, saisi uniquement si vide dans S2i
+    remplir_si_vide(frame, page, "#EF_22_29", "#EF_22_68", fitchs_rating, fitchs_rating_date, "Fitch")
+    touche(page, 'F4')
+    return frame
+
+def enregistrer_erreur(security_s2i, texte):
+    # [MODIF] n'écrit plus le fichier à chaque fois (cf. sauver_audits)
+    global df_audit_err
+    log_message = f"{datetime.now():%Y-%m-%d %H:%M:%S} - {texte}"
+    df_audit_err.loc[len(df_audit_err)] = [security_s2i, log_message]
+    df_audit_err.drop_duplicates(subset="Security_S2I", keep="last", inplace=True)
+    df_audit_err.reset_index(drop=True, inplace=True)
+
+def sauver_audits():
+    # [MODIF] un audit ouvert dans Excel en cours de run ne fait plus planter le robot
+    try:
+        df_audit_ok.to_excel(audit_ok_path, index=False)
+        df_audit_err.to_excel(audit_err_path, index=False)
+        return True
+    except PermissionError:
+        log("  [warn] fichier audit ouvert : sauvegarde reportée")
+        return False
+
+# =========================
+# [MODIF] Ouverture / reconnexion S2i (démarrage, après crash, et en préventif)
+# =========================
+def ouvrir_s2i(playwright):
+    browser = playwright.chromium.launch(
+        executable_path=r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        headless=False
+    )
+    try:
+        ETAT["crash"] = False
+        context = browser.new_context()
+        page = context.new_page()
+        page.on("crash", lambda _p: ETAT.update(crash=True))
+        page.set_default_timeout(9000)
+        page.set_viewport_size({"width": 1300, "height": 1250})
+
+        log("Accès à la page...")
+        page.goto(URL_S2I)
+        page.wait_for_load_state('networkidle')
+
+        frame3 = attendre_frame(page, "crysalid0", "#EF_4_71")
+        frame3.locator("#EF_4_71").fill(username)
+        frame3.locator("#EF_8_71").fill(password)
+        frame3.click('#entrerlib')
+
+        frame3 = attendre_frame(page, "crysalid0", 'xpath=//*[@onclick="resetSession();"]')
+        frame3.click('xpath=//*[@onclick="resetSession();"]')
+
+        frame3 = attendre_frame(page, "crysalid0", "#pf1")
+        frame3.click('#pf1')
+        page.wait_for_timeout(3000)
+
+        log(f"Connexion à S2I effectuée ! ({ROBOT['user']})")
+        return browser, page
+    except Exception:
+        fermer_s2i(browser)
+        raise
+
+def fermer_s2i(browser):
+    if browser is None:
+        return
+    try:
+        browser.close()
+    except Exception:
+        pass
+
+def reconnecter(playwright, browser, tentatives=3, attente_s=30):
+    fermer_s2i(browser)
+    for essai in range(1, tentatives + 1):
+        try:
+            return ouvrir_s2i(playwright)
+        except Exception as e:
+            log(f"  [reconnexion {essai}/{tentatives}] échec : {e}")
+            if essai < tentatives:
+                time.sleep(attente_s)
+    raise RuntimeError("Impossible de se reconnecter à S2i")
+
+# =========================
+# Traitement d'une valeur (toute la navigation OVAL)
+# =========================
+def traiter_valeur(page, row, periodes):
+    security_s2i = str(row[0]).strip()
+    isin = row[1]
+    currency = row[3]
+    libelle = row[4]
+    qte_usu_neg = v2s(row[11])
+    qte_min_neg = v2s(row[12])
+    val_nomi_min = v2s(row[13])
+    date_depart = row[15]
+    maturity_date = row[16]
+    sp_rating = row[17]
+    date_sp_rating = row[18]
+    moody_rating = row[19]
+    date_moody_rating = row[20]
+    fitchs_rating = row[21]
+    fitchs_rating_date = row[22]
+    date_sova = re.sub(r'\.0$', '', v2s(row[28]))
+    # [MODIF] non implémentés : commentaire, plc_bourse, ric, émetteur,
+    #         code_issuer_country, coupon, type_coupon
+
+    # -------------------
+    # OVAL - page 1
+    # -------------------
+    frame3 = ouvrir_oval(page, security_s2i, fitchs_rating, fitchs_rating_date)
+
+    for oval_try in range(3):
+        try:
+            if oval_try > 0:
+                log("Reprise directe sur OVAL")
+                frame3 = ouvrir_oval(page, security_s2i, fitchs_rating, fitchs_rating_date)
+
+            fill_avec_retry(frame3, page, "#EF_6_14", isin)
+
+            if date_sova == '31122099':
+                frame3.locator("#EF_5_37").fill('202')
+
+            frame3.locator("#EF_8_14").fill('001')
+            frame3.locator("#EF_9_20").fill(v2s(libelle))
+            frame3.locator("#EF_12_20").fill(v2s(libelle))
+            frame3.locator("#EF_13_20").fill(v2s(libelle))
+            frame3.locator("#EF_14_20").fill(v2s(libelle))
+            frame3.locator("#EF_18_20").fill('98')
+            break
+
+        except Exception as e_oval:
+            log(f"OVAL tentative {oval_try+1}/3 - {e_oval}")
+            if page.is_closed() or est_crash(e_oval) or oval_try == 2:
+                raise
+            if est_timeout(e_oval):
+                double_f4(page)
+
+    # -------------------
+    # Page 2
+    # -------------------
+    touche(page, 'F8')
+
+    if date_sova == '31122099':
+        fill_avec_retry(frame3, page, "#EF_8_17", "")
+    else:
+        fill_avec_retry(frame3, page, "#EF_8_17", maturity_date)
+
+    frame3.locator("#EF_9_17").fill(v2s(currency))
+    frame3.locator("#EF_10_17").fill(v2s(currency))
+    frame3.locator("#EF_12_17").fill(v2s(currency))
+    frame3.locator("#EF_16_17").fill('1')
+    frame3.locator("#EF_17_17").fill('001')
+    frame3.locator("#EF_18_17").fill(qte_usu_neg)
+    frame3.locator("#EF_18_54").fill(qte_min_neg)
+    frame3.locator("#EF_10_54").fill(val_nomi_min)
+    touche(page, 'Enter')
+
+    # Si EF_18_31 est non vide, alors clear
+    touche(page, 'F8')
+    champ_ef_18_31 = frame3.locator("#EF_18_31")
+    champ_ef_18_31.wait_for(state="visible", timeout=5000)
+    if champ_ef_18_31.input_value().strip() != "":
+        champ_ef_18_31.fill("")
+    touche(page, 'F8')
+
+    # -------------------
+    # Page 3
+    # -------------------
+    fill_avec_retry(frame3, page, "#EF_12_18", '05')
+    frame3.locator("#EF_17_18").fill('1')
+    frame3.locator("#EF_18_62").fill(v2s(date_depart))
+    frame3.locator("#EF_19_62").fill('100')
+    frame3.locator("#EF_21_18").fill('N')
+    touche(page, 'F8')
+
+    # -------------------
+    # Ratings S&P / Moody's : [MODIF] saisis uniquement si vides dans S2i
+    # -------------------
+    remplir_si_vide(frame3, page, "#EF_7_16", "#EF_7_57", sp_rating, date_sp_rating, "S&P")
+    remplir_si_vide(frame3, page, "#EF_8_16", "#EF_8_57", moody_rating, date_moody_rating, "Moody's")
+    touche(page, 'F8')
+
+    # -------------------
+    # Page 6 : périodes de coupon selon coupon_frequency
+    # -------------------
+    fill_avec_retry(frame3, page, "#EF_11_24", str(len(periodes)))
+    frame3.locator("#EF_17_16").fill(ANNEE)
+
+    for (champ_1, champ_2), p in zip(CHAMPS_PERIODES, periodes):
+        frame3.locator(champ_1).fill(p)
+        frame3.locator(champ_2).fill(p)
+
+    for _ in range(5):
+        touche(page, 'F8')
+
+    fill_avec_retry(frame3, page, "#EF_10_20", '00')
+    touche(page, 'F8')
+    touche(page, 'F8')
+
+    fill_avec_retry(frame3, page, "#EF_7_25", "1")
+    frame3.locator("#EF_8_25").fill("1")
+    frame3.locator("#EF_9_25").fill("1")
+    touche(page, 'F8')
+
+    fill_avec_retry(frame3, page, "#EF_17_21", "0")
+    frame3.locator("#EF_23_1").fill("OUI")
+    touche(page, 'Enter')
+
+    # -------------------
+    # Message final S2I (+ [MODIF] gestion du E1170 à quittancer, comme les robots fees)
+    # -------------------
+    message_final = lire_message_final(frame3)
+    if CODE_QUITTANCE in message_final.upper():
+        log(f"Message à quittancer détecté pour {security_s2i}")
+        touche(page, "F2")
+        fill_avec_retry(frame3, page, "#EF_6_1", "X")
+        touche(page, "Enter")
+        touche(page, "F6")
+        fill_avec_retry(frame3, page, "#EF_23_1", "OUI")
+        touche(page, "Enter")
+        message_final = lire_message_final(frame3)
+    return message_final
+
+# =========================
+# Run
+# =========================
+def run(playwright):
+    global df_audit_ok, df_audit_err, codes_deja_traite
+
+    browser = None
+    nb_ok = 0
+    nb_erreurs = 0
+    nb_traites = 0
+    nb_reconnexions = 0
+    debut_run = time.time()
+
+    if not reste:
+        log("Rien à traiter.")
+        return 0
+
+    try:
+        browser, page = reconnecter(playwright, None)
+
+        for row in reste:
+            security_s2i = str(row[0]).strip()
+            if security_s2i in codes_deja_traite:
+                continue
+
+            # Contrôle des périodes de coupon AVANT toute action S2I (pas de retry inutile)
+            try:
+                periodes = periodes_coupon(row)
+            except ValueError as e:
+                log(f"ERREUR données pour {security_s2i} : {e}")
+                enregistrer_erreur(security_s2i, f"DONNEES {security_s2i} - {e}")
+                codes_deja_traite.add(security_s2i)
+                nb_erreurs += 1
+                continue
+
+            if page.is_closed() or ETAT["crash"]:  # [MODIF] reconnexion au lieu d'arrêter le run
+                log("Page S2i fermée/plantée, reconnexion...")
+                browser, page = reconnecter(playwright, browser)
+
+            debut_valeur = time.time()
+
+            for tentative_valeur in range(1, TENTATIVES_VALEUR + 1):
+                try:
+                    log(f"===== Traitement de la valeur {security_s2i} (essai {tentative_valeur}/{TENTATIVES_VALEUR}) =====")
+                    log(f"coupon_frequency = {len(periodes)} -> périodes {periodes}")
+
+                    message_final = traiter_valeur(page, row, periodes)
+
+                    if MESSAGE_SUCCES in message_final.upper():
+                        log(f"OK : {security_s2i} traité en {time.time() - debut_valeur:.0f}s")
+                        log_message = f"{datetime.now():%Y-%m-%d %H:%M:%S} - VALEUR {security_s2i} traite - {message_final}"
+                        df_audit_ok.loc[len(df_audit_ok)] = [security_s2i, log_message]
+                        df_audit_err = df_audit_err[df_audit_err["Security_S2I"] != security_s2i].reset_index(drop=True)
+                        nb_ok += 1
+                    else:
+                        texte_erreur = f"ECHEC {security_s2i} - message final: {message_final if message_final else 'AUCUN MESSAGE'}"
+                        log(texte_erreur)
+                        enregistrer_erreur(security_s2i, texte_erreur)
+                        nb_erreurs += 1
+
+                    codes_deja_traite.add(security_s2i)
+                    double_f4(page)
+                    break
+
+                except Exception as e:
+                    # [MODIF] crash S2i/Chrome : relance Chrome, reconnexion, nouvelle tentative
+                    try:
+                        frame_absente = page.is_closed() or page.frame(name="crysalid0") is None
+                    except Exception:
+                        frame_absente = True
+                    if est_crash(e) or frame_absente:
+                        nb_reconnexions += 1
+                        log(f"S2i a planté sur {security_s2i} ({e}) -> reconnexion {nb_reconnexions}/{MAX_RECONNEXIONS}")
+                        sauver_audits()
+                        if nb_reconnexions > MAX_RECONNEXIONS:
+                            log("Trop de crashs, arrêt du robot (relance-le plus tard, il reprendra où il en était).")
+                            raise
+                        browser, page = reconnecter(playwright, browser)
+                        if tentative_valeur < TENTATIVES_VALEUR:
+                            continue
+                        enregistrer_erreur(security_s2i, f"CRASH {security_s2i} - S2i a planté {TENTATIVES_VALEUR} fois sur ce code")
+                        nb_erreurs += 1
+                        break
+
+                    if est_timeout(e) and tentative_valeur < TENTATIVES_VALEUR:
+                        log(f"Locator manquant pour {security_s2i}, relance du traitement après F4")
+                        double_f4(page)
+                        continue
+
+                    log(f"ERREUR pour {security_s2i} : {e}")
+                    enregistrer_erreur(security_s2i, f"EXCEPTION {security_s2i} - {e}")
+                    codes_deja_traite.add(security_s2i)
+                    nb_erreurs += 1
+                    double_f4(page)
+                    break
+
+            nb_traites += 1
+            if nb_traites % SAUVEGARDE_TOUS_LES == 0:
+                sauver_audits()
+
+            if REDEMARRAGE_TOUS_LES and nb_traites % REDEMARRAGE_TOUS_LES == 0:
+                log(f"Redémarrage préventif de Chrome après {nb_traites} codes")
+                sauver_audits()
+                browser, page = reconnecter(playwright, browser)
+
+    finally:
+        # [MODIF] audits sauvegardés et Chrome fermé quoi qu'il arrive (crash, Ctrl+C...)
+        sauver_audits()
+        fermer_s2i(browser)
+
+    log(f"Bilan robot {ROBOT_ID} ({ROBOT['user']}) : {nb_ok} OK, {nb_erreurs} erreur(s) en {time.time() - debut_run:.0f}s")
+    return nb_erreurs
+
+if __name__ == "__main__":
+    with sync_playwright() as playwright:
+        nb_erreurs = run(playwright)
+    sys.exit(1 if nb_erreurs else 0)
