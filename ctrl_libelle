@@ -88,7 +88,7 @@ LEGAL_STRICT = LEGAL_FORMS - STOPWORDS - {"AS", "CO"}
 DROPPABLE = GENERIC | {"GRP", "HLDG", "FDG", "SVCS", "CAP", "CO", "THE", "OF", "DE", "DU", "LA", "LE"}
 
 FORMAT_RE = re.compile(
-    r"^(?P<iss>\S.*?) (?P<cpn>\d+\.\d+)" + re.escape(PCT_SEP) +
+    r"^(?P<iss>\S.*?) (?P<cpn>\d+(?:\.\d+)?)" + re.escape(PCT_SEP) +
     r"(?P<mat>\d{2}/\d{2}/\d{4}|" + PERP_TOKEN + r")$")
 
 
@@ -102,8 +102,22 @@ def clean(s):
 
 
 def fmt_cpn(x):
-    s = f"{float(x):.6f}".rstrip("0")
-    return s + "0" if s.endswith(".") else s
+    """Coupon proposé : entier sans décimale (4), sinon au moins 2 décimales sans zéro inutile
+    au-delà (1.50, 0.125, 3.5094)."""
+    x = round(float(x), 6)
+    if x == int(x):
+        return str(int(x))
+    s = f"{x:.6f}".rstrip("0")
+    return s if len(s.split(".")[1]) >= 2 else f"{x:.2f}"
+
+
+def cpn_ok(cpn_str):
+    """Coupon accepté dans le libellé actuel : 4 / 4.0 / 4.00, 1.5 / 1.50, 0.125 ;
+    refusé : zéro final au-delà de la 2e décimale (1.550, 3.000)."""
+    if "." not in cpn_str:
+        return True
+    dec = cpn_str.split(".")[1]
+    return len(dec) <= 2 or not dec.endswith("0")
 
 
 def safe_date(y, m, d):
@@ -378,7 +392,7 @@ def run():
         if p["cpn"] is None:
             anomalies.append("Coupon absent")
         else:
-            if p["cpn_str"] != fmt_cpn(p["cpn"]):
+            if not cpn_ok(p["cpn_str"]):
                 anomalies.append(f"Coupon mal formaté ({p['cpn_str']} -> {fmt_cpn(p['cpn'])})")
             if pd.notna(r_cpn) and abs(p["cpn"] - r_cpn) > 1e-6:
                 anomalies.append(f"Coupon ≠ Reuters ({fmt_cpn(p['cpn'])} vs {fmt_cpn(r_cpn)})")
@@ -426,16 +440,21 @@ def run():
         cpn = r_cpn if pd.notna(r_cpn) else p["cpn"]
         mat = PERP_TOKEN if is_perp else (r_mat or mat_lbl)
         iss = target_iss or p["iss"]
-        proposed = ""
+        proposed = proposed_cmp = ""
         if iss and cpn is not None and mat:
             suffix = f" {fmt_cpn(cpn)}{PCT_SEP}{mat if isinstance(mat, str) else mat.strftime('%d/%m/%Y')}"
             iss_fit = fit_issuer(iss, MAX_LABEL_LEN - len(suffix))
             if iss_fit != iss:
                 infos.append(f"Émetteur raccourci pour tenir en {MAX_LABEL_LEN} car. ({iss} -> {iss_fit})")
-            proposed = iss_fit + suffix
+            proposed = proposed_cmp = iss_fit + suffix
+            # libellé actuel identique au proposé, à l'écriture du coupon près (1.5% vs 1.50%) : pas de modif
+            if p["cpn_str"] and cpn_ok(p["cpn_str"]) and p["cpn"] == round(float(cpn), 6):
+                same = label == proposed.replace(f" {fmt_cpn(cpn)}{PCT_SEP}", f" {p['cpn_str']}{PCT_SEP}", 1)
+                if same:
+                    proposed_cmp = label
 
         statut = "OK" if not anomalies else "KO"
-        if statut == "OK" and proposed and proposed != label:
+        if statut == "OK" and proposed and proposed_cmp != label:
             statut = "A REVOIR"
         elif statut == "OK" and infos:
             statut = "OK (info)"
@@ -445,7 +464,7 @@ def run():
             "Anomalies": " | ".join(anomalies),
             "Infos": " | ".join(infos),
             "Libellé_Proposé": proposed,
-            "Modif": "" if proposed == label or not proposed else "X",
+            "Modif": "" if proposed_cmp == label or not proposed else "X",
             "Lbl_Emetteur": p["iss"],
             "Lbl_Coupon": p["cpn"],
             "Lbl_Maturité": p["date_str"],
