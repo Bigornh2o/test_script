@@ -1,0 +1,402 @@
+"""
+Contrôle des libellés obligataires S2I
+Format attendu :  <EMETTEUR> <COUPON> % <DD/MM/YYYY>     ex : KBC GROUPE 0.125 % 14/01/2029
+Perpétuelles   :  <EMETTEUR> <COUPON> % PERP
+
+Entrées :
+  - l'extract référentiel (ISIN, libellé, type)
+  - les données Reuters (émetteur, coupon, maturité) : soit dans le même fichier,
+    soit dans un fichier séparé joint sur l'ISIN
+  - optionnel : un fichier de mapping "émetteur Reuters -> nom court maison"
+    (généré au 1er run dans l'onglet Emetteurs, à corriger puis réinjecter)
+
+Sortie : un Excel avec le détail ligne à ligne + l'onglet Emetteurs + un résumé.
+"""
+import re
+import unicodedata
+from collections import Counter
+from datetime import date
+from pathlib import Path
+
+import pandas as pd
+
+# =========================== CONFIG ===========================
+INPUT_FILE = r"P:\CPSI_CONTROL_DATA\SAS_DATA\02_Controles_Referentiel_Valeur\Resultat_Controle_Jour\Univers_Obligataire.csv"
+# INPUT_SHEET = "Univers_Obligataire"
+
+REUTERS_FILE = r"P:\CPSI_CONTROL_DATA\SAS_DATA\02_Controles_Referentiel_Valeur\DATA_INPUT\Extract_bds.csv"   # CSV (ou xlsx) avec ISIN + émetteur + coupon + maturité
+REUTERS_SHEET = 0              # utilisé seulement si REUTERS_FILE est un xlsx
+CSV_SEP = ";"
+
+MAPPING_FILE = "mapping_emetteurs.xlsx"   # optionnel, ignoré s'il n'existe pas
+OUTPUT_FILE = "controle_libelles.xlsx"
+
+COL_ISIN = "ISIN"
+COL_LABEL = "S2I_Security_Name"
+COL_TYPE = "Security_Type"
+COL_R_ISSUER = "Issuer Name"   # colonnes Reuters
+COL_R_COUPON = "Coupon Rate"
+COL_R_MATURITY = "Maturity Date"
+
+PCT_SEP = " % "                # séparateur coupon/date attendu
+PERP_TOKEN = "PERP"
+MAX_ISSUER_LEN = 25            # longueur max du nom court proposé
+ISSUER_THRESHOLD = 80          # score mini (0-100) pour considérer l'émetteur OK
+PERP_TYPES = {202, 203}
+VAR_TYPES = {205}
+# ==============================================================
+
+try:
+    from rapidfuzz import fuzz
+    def _ratio(a, b): return fuzz.ratio(a, b)
+except ImportError:
+    from difflib import SequenceMatcher
+    def _ratio(a, b): return SequenceMatcher(None, a, b).ratio() * 100
+
+MONTHS = {m: i for i, m in enumerate(
+    ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"], 1)}
+MONTHS.update({"FEV": 2, "AVR": 4, "MAI": 5, "JUI": 6, "AOU": 8, "DEC": 12})
+
+LEGAL_FORMS = {
+    "SA", "NV", "AG", "SE", "PLC", "INC", "LTD", "LIMITED", "GMBH", "SPA", "BV", "AB", "ASA",
+    "OYJ", "SCA", "SAS", "SARL", "CORP", "CORPORATION", "CO", "COMPANY", "LLC", "LP", "KG",
+    "SCOSA", "SCRL", "CVBA", "SRL", "SL", "AS", "A/S", "THE", "OF", "DE", "DU", "LA", "LE",
+}
+GENERIC = {"GROUP", "GROUPE", "HOLDING", "HOLDINGS", "FINANCE", "FIN", "INTERNATIONAL", "INTL",
+           "FUNDING", "CAPITAL", "SERVICES", "BV"}
+SYNONYMS = {"BANQUE": "BANK", "BANCA": "BANK", "BANCO": "BANK", "BANKA": "BANK"}
+
+FORMAT_RE = re.compile(
+    r"^(?P<iss>\S.*?) (?P<cpn>\d+\.\d+)" + re.escape(PCT_SEP) +
+    r"(?P<mat>\d{2}/\d{2}/\d{4}|" + PERP_TOKEN + r")$")
+
+
+# --------------------------- utils ---------------------------
+def strip_accents(s):
+    return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+
+
+def clean(s):
+    return re.sub(r"\s+", " ", strip_accents(str(s)).upper()).strip() if pd.notna(s) else ""
+
+
+def fmt_cpn(x):
+    s = f"{float(x):.6f}".rstrip("0")
+    return s + "0" if s.endswith(".") else s
+
+
+def safe_date(y, m, d):
+    try:
+        return date(y, m, d)
+    except ValueError:
+        return None
+
+
+def year4(y):
+    y = int(y)
+    return y + 2000 if y < 100 else y
+
+
+# --------------------------- parsing du libellé ---------------------------
+DATE_PATTERNS = [
+    ("slash", re.compile(r"(?<!\d)(\d{1,2})/(\d{1,2})/(\d{4}|\d{2})(?!\d)")),
+    ("dot", re.compile(r"(?<![\d.])(\d{1,2})\.(\d{1,2})\.(\d{4})(?!\d)")),
+    ("mon", re.compile(r"(?<!\d)(\d{1,2})-?([A-Z]{3})-?(\d{4}|\d{2})(?!\d)")),
+]
+
+
+def parse_label(label):
+    lab = clean(label)
+    out = {"iss": "", "cpn": None, "cpn_str": "", "dates": [], "date_str": "",
+           "date_fmt": "", "ddmm": None, "perp": False, "var": False, "first_token": None}
+    spans = []
+
+    # date
+    for kind, pat in DATE_PATTERNS:
+        m = pat.search(lab)
+        if not m:
+            continue
+        a, b, y = m.groups()
+        y = year4(y)
+        cands = []
+        if kind == "mon":
+            if b in MONTHS:
+                cands = [safe_date(y, MONTHS[b], int(a))]
+            else:
+                continue
+        else:
+            a, b = int(a), int(b)
+            out["ddmm"] = safe_date(y, b, a)
+            cands = [safe_date(y, b, a)]                    # dd/mm
+            if kind == "slash":
+                cands.append(safe_date(y, a, b))            # mm/dd (format US)
+        cands = list(dict.fromkeys(c for c in cands if c))
+        if cands:
+            out["dates"], out["date_str"], out["date_fmt"] = cands, m.group(0), kind
+            spans.append(("date", m.start(), m.end()))
+            break
+
+    # coupon (on masque la date pour ne pas la confondre)
+    masked = lab
+    if out["date_str"]:
+        s, e = spans[-1][1], spans[-1][2]
+        masked = lab[:s] + " " * (e - s) + lab[e:]
+    m = re.search(r"(\d+(?:[.,]\d+)?)\s*%", masked) or re.search(r"(?<![\d/])(\d+\.\d+)(?![\d/])", masked)
+    if m:
+        out["cpn_str"] = m.group(1)
+        out["cpn"] = float(m.group(1).replace(",", "."))
+        spans.append(("cpn", m.start(), m.end()))
+
+    for tok, key in ((r"\bPERP\b", "perp"), (r"\bVAR\b|\bFRN\b", "var")):
+        m = re.search(tok, lab)
+        if m:
+            out[key] = True
+            spans.append((key, m.start(), m.end()))
+
+    if spans:
+        first = min(spans, key=lambda x: x[1])
+        out["iss"] = lab[:first[1]].strip(" -_/")
+        out["first_token"] = first[0]
+    else:
+        out["iss"] = lab
+    return out
+
+
+# --------------------------- émetteur ---------------------------
+def issuer_tokens(s):
+    toks = re.sub(r"[^A-Z0-9 ]", " ", clean(s).replace("/", " ")).split()
+    toks = [SYNONYMS.get(t, t) for t in toks]
+    return [t for t in toks if t not in LEGAL_FORMS and t not in GENERIC]
+
+
+def issuer_score(lbl_iss, ref_iss):
+    a, b = issuer_tokens(lbl_iss), issuer_tokens(ref_iss)
+    if not a or not b:
+        return 0
+    if set(a) <= set(b):
+        return 100
+    if len(a) == 1 and a[0] == "".join(t[0] for t in b):          # sigle (ABI, VGP...)
+        return 95
+    if all(any(tb.startswith(ta) for tb in b) for ta in a):         # abréviations
+        return 90
+    return round(max(_ratio(" ".join(a), " ".join(b)), _ratio("".join(a), "".join(b))))
+
+
+def short_name(ref_iss):
+    toks = clean(ref_iss).replace("/", " ").replace(",", " ").split()
+    while toks and toks[-1].strip(".") in LEGAL_FORMS:
+        toks.pop()
+    res = ""
+    for t in toks:
+        if len(res) + len(t) + (1 if res else 0) > MAX_ISSUER_LEN:
+            break
+        res = f"{res} {t}".strip()
+    return res or " ".join(toks)[:MAX_ISSUER_LEN]
+
+
+def to_date(x):
+    """Maturité Reuters : datetime, ISO (2029-01-14) ou français (14/01/2029)."""
+    if pd.isna(x) or str(x).strip() == "":
+        return None
+    if isinstance(x, (pd.Timestamp, date)):
+        return pd.Timestamp(x).date()
+    s = str(x).strip().split(" ")[0]
+    for f in ("%Y-%m-%d", "%d/%m/%Y", "%d.%m.%Y", "%d-%m-%Y", "%Y%m%d"):
+        try:
+            return pd.to_datetime(s, format=f).date()
+        except ValueError:
+            pass
+    return None
+
+
+# --------------------------- main ---------------------------
+def load():
+    df = pd.read_csv(INPUT_FILE, dtype={COL_ISIN: str}, sep=';')
+    if REUTERS_FILE:
+        if REUTERS_FILE.lower().endswith(".csv"):
+            try:
+                rd = pd.read_csv(REUTERS_FILE, sep=CSV_SEP, dtype=str, encoding="utf-8-sig")
+            except UnicodeDecodeError:
+                rd = pd.read_csv(REUTERS_FILE, sep=CSV_SEP, dtype=str, encoding="cp1252")
+            rd.columns = rd.columns.str.strip()
+        else:
+            rd = pd.read_excel(REUTERS_FILE, sheet_name=REUTERS_SHEET)
+        rd[COL_ISIN] = rd[COL_ISIN].astype(str).str.strip()
+        rd = rd[[COL_ISIN, COL_R_ISSUER, COL_R_COUPON, COL_R_MATURITY]].drop_duplicates(COL_ISIN)
+        df[COL_ISIN] = df[COL_ISIN].astype(str).str.strip()
+        df = df.merge(rd, on=COL_ISIN, how="left")
+    df[COL_R_MATURITY] = df[COL_R_MATURITY].map(to_date)
+    df[COL_R_COUPON] = pd.to_numeric(
+        df[COL_R_COUPON].astype(str).str.replace(",", ".").str.replace("%", "").str.strip(),
+        errors="coerce")
+    mapping = {}
+    if MAPPING_FILE and Path(MAPPING_FILE).exists():
+        mp = pd.read_excel(MAPPING_FILE)
+        mapping = {clean(r): clean(n) for r, n in zip(mp["Reuters_Issuer"], mp["Nom_Court"]) if pd.notna(n)}
+        print(f"Mapping chargé : {len(mapping)} émetteurs")
+    return df, mapping
+
+
+def run():
+    df, mapping = load()
+    parsed = [parse_label(x) for x in df[COL_LABEL]]
+    ref_iss = df[COL_R_ISSUER].map(clean)
+    scores = [issuer_score(p["iss"], r) if r else None for p, r in zip(parsed, ref_iss)]
+
+    # nom court par émetteur Reuters : mapping > nom "maison" le plus fréquent > Reuters raccourci
+    house = {}
+    for p, r, s in zip(parsed, ref_iss, scores):
+        if r and s is not None and s >= ISSUER_THRESHOLD and p["iss"]:
+            house.setdefault(r, Counter())[p["iss"]] += 1
+    issuer_name = {}
+    for r in set(ref_iss) - {""}:
+        issuer_name[r] = mapping.get(r) or (house[r].most_common(1)[0][0] if r in house else short_name(r))
+
+    rows = []
+    for i, p in enumerate(parsed):
+        row = df.iloc[i]
+        label = clean(row[COL_LABEL])
+        r_iss, r_cpn, r_mat = ref_iss.iloc[i], row[COL_R_COUPON], row[COL_R_MATURITY]
+        r_mat = r_mat if (pd.notna(r_mat) and isinstance(r_mat, date)) else None
+        try:
+            stype = int(row[COL_TYPE])
+        except (ValueError, TypeError):
+            stype = None
+        # perpétuelle = pas de maturité Reuters (si dispo), sinon type / mention PERP
+        is_perp = (r_mat is None) if r_iss else (stype in PERP_TYPES or p["perp"])
+        anomalies, infos = [], []
+
+        if not r_iss:
+            anomalies.append("Pas de données Reuters")
+
+        # format
+        fm = FORMAT_RE.match(label)
+        if not fm:
+            anomalies.append("Format non conforme")
+        if p["first_token"] == "date":
+            anomalies.append("Date avant le coupon")
+
+        # coupon
+        if p["cpn"] is None:
+            anomalies.append("Coupon absent")
+        else:
+            if p["cpn_str"] != fmt_cpn(p["cpn"]):
+                anomalies.append(f"Coupon mal formaté ({p['cpn_str']} -> {fmt_cpn(p['cpn'])})")
+            if pd.notna(r_cpn) and abs(p["cpn"] - r_cpn) > 1e-6:
+                anomalies.append(f"Coupon ≠ Reuters ({fmt_cpn(p['cpn'])} vs {fmt_cpn(r_cpn)})")
+        if stype in VAR_TYPES or p["var"]:
+            infos.append("Taux variable : coupon à valider manuellement")
+
+        # maturité
+        mat_lbl = None
+        if is_perp:
+            if p["dates"] and r_mat is None:
+                anomalies.append("Date dans le libellé alors que perpétuelle")
+            if not p["perp"] and r_mat is None:
+                anomalies.append(f"Mention {PERP_TOKEN} absente")
+        elif not p["dates"]:
+            anomalies.append("Maturité absente / illisible")
+        else:
+            if r_mat and r_mat in p["dates"]:
+                mat_lbl = r_mat
+            elif r_mat:
+                anomalies.append(f"Maturité ≠ Reuters ({p['date_str']} vs {r_mat:%d/%m/%Y})")
+            else:
+                mat_lbl = p["dates"][0]
+            if mat_lbl and p["date_fmt"] == "slash" and p["ddmm"] != mat_lbl:
+                anomalies.append(f"Date au format US mm/dd ({p['date_str']})")
+            elif not re.fullmatch(r"\d{2}/\d{2}/\d{4}", p["date_str"]):
+                anomalies.append(f"Date mal formatée ({p['date_str']})")
+            elif r_mat is None and len(p["dates"]) > 1:
+                infos.append("Date ambiguë dd/mm vs mm/dd (pas de réf Reuters)")
+
+        # émetteur
+        target_iss = issuer_name.get(r_iss)
+        sc = scores[i]
+        if r_iss:
+            if r_iss in mapping:
+                if p["iss"] != mapping[r_iss]:
+                    anomalies.append(f"Émetteur ≠ nom court référence ({mapping[r_iss]})")
+            elif sc < ISSUER_THRESHOLD:
+                anomalies.append(f"Émetteur à vérifier (score {sc})")
+            elif p["iss"] != target_iss:
+                infos.append(f"Nom émetteur non homogène (majoritaire : {target_iss})")
+            if len(p["iss"]) > MAX_ISSUER_LEN:
+                infos.append(f"Nom émetteur long ({len(p['iss'])} car.)")
+
+        # libellé proposé
+        cpn = r_cpn if pd.notna(r_cpn) else p["cpn"]
+        mat = PERP_TOKEN if is_perp else (r_mat or mat_lbl)
+        iss = target_iss or p["iss"]
+        proposed = ""
+        if iss and cpn is not None and mat:
+            proposed = f"{iss} {fmt_cpn(cpn)}{PCT_SEP}{mat if isinstance(mat, str) else mat.strftime('%d/%m/%Y')}"
+
+        statut = "OK" if not anomalies else "KO"
+        if statut == "OK" and proposed and proposed != label:
+            statut = "A REVOIR"
+        elif statut == "OK" and infos:
+            statut = "OK (info)"
+
+        rows.append({
+            "Statut": statut,
+            "Anomalies": " | ".join(anomalies),
+            "Infos": " | ".join(infos),
+            "Libellé_Proposé": proposed,
+            "Modif": "" if proposed == label or not proposed else "X",
+            "Lbl_Emetteur": p["iss"],
+            "Lbl_Coupon": p["cpn"],
+            "Lbl_Maturité": p["date_str"],
+            "Score_Emetteur": sc,
+        })
+
+    res = pd.concat([df.reset_index(drop=True), pd.DataFrame(rows)], axis=1)
+
+    emetteurs = (pd.DataFrame({"Reuters_Issuer": ref_iss, "Lbl": [p["iss"] for p in parsed]})
+                 .query("Reuters_Issuer != ''")
+                 .groupby("Reuters_Issuer")
+                 .agg(Nb_titres=("Lbl", "size"),
+                      Noms_dans_libelles=("Lbl", lambda s: " ; ".join(pd.Series(s).value_counts().index[:5])))
+                 .reset_index())
+    emetteurs.insert(1, "Nom_Court", emetteurs["Reuters_Issuer"].map(issuer_name))
+    emetteurs["Source"] = emetteurs["Reuters_Issuer"].map(
+        lambda r: "mapping" if r in mapping else ("libellés" if r in house else "Reuters raccourci"))
+    emetteurs = emetteurs.sort_values("Nb_titres", ascending=False)
+
+    synth = (res["Anomalies"].str.split(r" \| ").explode()
+             .str.replace(r"\s*\(.*", "", regex=True).replace("", pd.NA).dropna()
+             .value_counts().rename_axis("Anomalie").reset_index(name="Nb"))
+    statuts = res["Statut"].value_counts().rename_axis("Statut").reset_index(name="Nb")
+
+    write(res, emetteurs, statuts, synth)
+    print(statuts.to_string(index=False))
+    print(f"\n-> {OUTPUT_FILE}")
+
+
+def write(res, emetteurs, statuts, synth):
+    from openpyxl.styles import PatternFill, Font
+    from openpyxl.utils import get_column_letter
+    fills = {"OK": "C6EFCE", "OK (info)": "DDEBF7", "A REVOIR": "FFEB9C", "KO": "FFC7CE"}
+    with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as xw:
+        res.to_excel(xw, "Controle", index=False)
+        emetteurs.to_excel(xw, "Emetteurs", index=False)
+        statuts.to_excel(xw, "Synthese", index=False)
+        synth.to_excel(xw, "Synthese", index=False, startrow=len(statuts) + 3)
+        for ws in xw.book.worksheets:
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = ws.dimensions
+            for c in ws[1]:
+                c.font = Font(bold=True)
+            for col in ws.columns:
+                w = max(len(str(c.value or "")) for c in col[:300])
+                ws.column_dimensions[get_column_letter(col[0].column)].width = min(max(w + 2, 8), 60)
+        ws = xw.book["Controle"]
+        col_st = list(res.columns).index("Statut") + 1
+        for r in range(2, ws.max_row + 1):
+            c = ws.cell(r, col_st)
+            if c.value in fills:
+                c.fill = PatternFill("solid", fgColor=fills[c.value])
+
+
+if __name__ == "__main__":
+    run()
