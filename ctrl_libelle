@@ -62,7 +62,7 @@ MONTHS.update({"FEV": 2, "AVR": 4, "MAI": 5, "JUI": 6, "AOU": 8, "DEC": 12})
 LEGAL_FORMS = {
     "SA", "NV", "AG", "SE", "PLC", "INC", "LTD", "LIMITED", "GMBH", "SPA", "BV", "AB", "ASA",
     "OYJ", "SCA", "SAS", "SARL", "CORP", "CORPORATION", "CO", "COMPANY", "LLC", "LP", "KG",
-    "SCOSA", "SCRL", "CVBA", "SRL", "SL", "AS", "A/S", "THE", "OF", "DE", "DU", "LA", "LE",
+    "SCOSA", "SCRL", "CVBA", "UA", "KGAA", "LLC", "SRL", "SL", "AS", "A/S", "THE", "OF", "DE", "DU", "LA", "LE",
 }
 GENERIC = {"GROUP", "GROUPE", "HOLDING", "HOLDINGS", "FINANCE", "FIN", "INTERNATIONAL", "INTL",
            "FUNDING", "CAPITAL", "SERVICES", "BV"}
@@ -192,12 +192,15 @@ def issuer_tokens(s):
 
 
 def is_acronym(lbl_iss, ref_iss):
-    """Émetteur du libellé = sigle ou ticker du nom Reuters (GS, F, ABI...)."""
+    """Émetteur du libellé = sigle, ticker ou nom tronqué (GS, F, ABI, BARC, SAN...)."""
     a, b = issuer_tokens(lbl_iss), issuer_tokens(ref_iss)
     if len(a) != 1 or not b or a[0] in b:
         return False
     initials = "".join(t[0] for t in b)
-    return a[0] == initials or (len(a[0]) <= 2 and initials.startswith(a[0]))
+    if a[0] == initials or (len(a[0]) <= 2 and initials.startswith(a[0])):
+        return True
+    # mot unique court absent du nom Reuters : ticker Bloomberg ou nom tronqué (BARC, SAN, MCD, ENELIM...)
+    return len(a[0]) <= 6
 
 
 def drop_words(name):
@@ -214,7 +217,8 @@ def issuer_score(lbl_iss, ref_iss):
         return 100
     if is_acronym(lbl_iss, ref_iss):                                # sigle / ticker (GS, F...) : refusé
         return 60
-    if all(len(ta) >= 3 and any(tb.startswith(ta) for tb in b) for ta in a):   # abréviations
+    if all(len(ta) >= 4 and any(tb.startswith(ta) and len(ta) >= 0.6 * len(tb) for tb in b)
+           for ta in a):                                            # abréviations légères
         return 90
     return round(max(_ratio(" ".join(a), " ".join(b)), _ratio("".join(a), "".join(b))))
 
@@ -227,7 +231,7 @@ def strip_amp(s):
 
 def short_name(ref_iss):
     toks = strip_amp(clean(ref_iss)).replace("/", " ").replace(",", " ").split()
-    while len(toks) > 1 and toks[-1].strip(".") in LEGAL_FORMS:
+    while len(toks) > 1 and toks[-1].replace(".", "") in LEGAL_FORMS:
         toks.pop()
     if len(toks) > 1 and toks[0] == "THE":
         toks.pop(0)
@@ -244,10 +248,10 @@ def fit_issuer(iss, budget):
     fits = lambda: len(" ".join(toks)) <= budget
     if not fits():
         for i in range(1, len(toks)):
-            if toks[i].strip(".") in LEGAL_STRICT:
+            if toks[i].replace(".", "") in LEGAL_STRICT:
                 toks = toks[:i]
                 break
-    while not fits() and len(toks) > 1 and toks[-1].strip(".") in LEGAL_FORMS:
+    while not fits() and len(toks) > 1 and toks[-1].replace(".", "") in LEGAL_FORMS:
         toks.pop()
     for i in reversed(range(1, len(toks))):
         if fits():
@@ -330,14 +334,14 @@ def run():
     # nom court par émetteur Reuters : mapping > nom "maison" le plus fréquent > Reuters raccourci
     house = {}
     for p, r, s in zip(parsed, ref_iss, scores):
-        if r and s is not None and s >= ISSUER_THRESHOLD and p["iss"]:
+        if r and s == 100 and p["iss"] and not is_acronym(p["iss"], r):
             house.setdefault(r, Counter())[p["iss"]] += 1
     issuer_name = {}
     for r in set(ref_iss) - {""}:
         if r in mapping:
             issuer_name[r] = strip_amp(mapping[r])
         else:
-            issuer_name[r] = drop_words(strip_amp(house[r].most_common(1)[0][0] if r in house else short_name(r)))
+            issuer_name[r] = drop_words(short_name(house[r].most_common(1)[0][0] if r in house else r))
 
     rows = []
     for i, p in enumerate(parsed):
@@ -412,7 +416,7 @@ def run():
                 if p["iss"] != mapping[r_iss]:
                     anomalies.append(f"Émetteur ≠ nom court référence ({mapping[r_iss]})")
             elif is_acronym(p["iss"], r_iss):
-                anomalies.append(f"Émetteur en sigle/ticker ({p['iss']})")
+                anomalies.append(f"Émetteur en sigle/ticker/tronqué ({p['iss']})")
             elif sc < ISSUER_THRESHOLD:
                 anomalies.append(f"Émetteur à vérifier (score {sc})")
             elif p["iss"] != target_iss:
