@@ -88,7 +88,7 @@ LEGAL_STRICT = LEGAL_FORMS - STOPWORDS - {"AS", "CO"}
 DROPPABLE = GENERIC | {"GRP", "HLDG", "FDG", "SVCS", "CAP", "CO", "THE", "OF", "DE", "DU", "LA", "LE"}
 
 FORMAT_RE = re.compile(
-    r"^(?P<iss>\S.*?) (?P<cpn>\d+(?:\.\d+)?)" + re.escape(PCT_SEP) +
+    r"^(?P<iss>\S.*?) (?P<cpn>\d+(?:\.\d+)?) ?" + re.escape(PCT_SEP) +
     r"(?P<mat>\d{2}/\d{2}/\d{4}|" + PERP_TOKEN + r")$")
 
 
@@ -374,7 +374,7 @@ def run():
         # format
         raw = str(row[COL_LABEL]) if pd.notna(row[COL_LABEL]) else ""
         if re.search(r"\d\s+%", raw):
-            anomalies.append("Espace entre le coupon et le %")
+            infos.append("Espace entre le coupon et le %")
         if len(raw.strip()) > MAX_LABEL_LEN:
             anomalies.append(f"Libellé > {MAX_LABEL_LEN} car. ({len(raw.strip())})")
         removed = [t for t in p["iss"].split()[1:] if t in WORDS_REMOVED]
@@ -449,7 +449,7 @@ def run():
             proposed = proposed_cmp = iss_fit + suffix
             # libellé actuel identique au proposé, à l'écriture du coupon près (1.5% vs 1.50%) : pas de modif
             if p["cpn_str"] and cpn_ok(p["cpn_str"]) and p["cpn"] == round(float(cpn), 6):
-                same = label == proposed.replace(f" {fmt_cpn(cpn)}{PCT_SEP}", f" {p['cpn_str']}{PCT_SEP}", 1)
+                same = re.sub(r"(\d) +%", r"\1%", label) == proposed.replace(f" {fmt_cpn(cpn)}{PCT_SEP}", f" {p['cpn_str']}{PCT_SEP}", 1)
                 if same:
                     proposed_cmp = label
 
