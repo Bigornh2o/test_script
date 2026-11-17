@@ -42,6 +42,8 @@ PCT_SEP = "% "                 # séparateur coupon/date attendu (% collé au co
 PERP_TOKEN = "PERP"
 MAX_LABEL_LEN = 40             # longueur max du libellé S2I
 ISSUER_THRESHOLD = 80          # score mini (0-100) pour considérer l'émetteur OK
+# mots retirés du nom émetteur, sauf s'ils sont en tête (« SERVICES ... » reste)
+WORDS_REMOVED = {"FINANCIAL", "FINANCE", "FIN", "SERVICES", "SERVICE", "SVCS", "FUNDING"}
 PERP_TYPES = {202, 203}
 VAR_TYPES = {205}
 # ==============================================================
@@ -189,15 +191,30 @@ def issuer_tokens(s):
     return [t for t in toks if t not in LEGAL_FORMS and t not in DROPPABLE]
 
 
+def is_acronym(lbl_iss, ref_iss):
+    """Émetteur du libellé = sigle ou ticker du nom Reuters (GS, F, ABI...)."""
+    a, b = issuer_tokens(lbl_iss), issuer_tokens(ref_iss)
+    if len(a) != 1 or not b or a[0] in b:
+        return False
+    initials = "".join(t[0] for t in b)
+    return a[0] == initials or (len(a[0]) <= 2 and initials.startswith(a[0]))
+
+
+def drop_words(name):
+    """Retire les mots de WORDS_REMOVED, sauf le premier mot."""
+    toks = name.split()
+    return " ".join(toks[:1] + [t for t in toks[1:] if t not in WORDS_REMOVED])
+
+
 def issuer_score(lbl_iss, ref_iss):
     a, b = issuer_tokens(lbl_iss), issuer_tokens(ref_iss)
     if not a or not b:
         return 0
     if set(a) <= set(b):
         return 100
-    if len(a) == 1 and a[0] == "".join(t[0] for t in b):          # sigle (ABI, VGP...)
-        return 95
-    if all(any(tb.startswith(ta) for tb in b) for ta in a):         # abréviations
+    if is_acronym(lbl_iss, ref_iss):                                # sigle / ticker (GS, F...) : refusé
+        return 60
+    if all(len(ta) >= 3 and any(tb.startswith(ta) for tb in b) for ta in a):   # abréviations
         return 90
     return round(max(_ratio(" ".join(a), " ".join(b)), _ratio("".join(a), "".join(b))))
 
@@ -212,6 +229,8 @@ def short_name(ref_iss):
     toks = strip_amp(clean(ref_iss)).replace("/", " ").replace(",", " ").split()
     while len(toks) > 1 and toks[-1].strip(".") in LEGAL_FORMS:
         toks.pop()
+    if len(toks) > 1 and toks[0] == "THE":
+        toks.pop(0)
     return " ".join(toks)
 
 
@@ -315,8 +334,10 @@ def run():
             house.setdefault(r, Counter())[p["iss"]] += 1
     issuer_name = {}
     for r in set(ref_iss) - {""}:
-        issuer_name[r] = strip_amp(
-            mapping.get(r) or (house[r].most_common(1)[0][0] if r in house else short_name(r)))
+        if r in mapping:
+            issuer_name[r] = strip_amp(mapping[r])
+        else:
+            issuer_name[r] = drop_words(strip_amp(house[r].most_common(1)[0][0] if r in house else short_name(r)))
 
     rows = []
     for i, p in enumerate(parsed):
@@ -338,6 +359,9 @@ def run():
             anomalies.append("Espace entre le coupon et le %")
         if len(raw.strip()) > MAX_LABEL_LEN:
             anomalies.append(f"Libellé > {MAX_LABEL_LEN} car. ({len(raw.strip())})")
+        removed = [t for t in p["iss"].split()[1:] if t in WORDS_REMOVED]
+        if removed:
+            anomalies.append(f"Mot à retirer de l'émetteur ({', '.join(removed)})")
         if "&" in p["iss"]:
             anomalies.append("« & » dans le nom émetteur")
         fm = FORMAT_RE.match(label)
@@ -387,6 +411,8 @@ def run():
             if r_iss in mapping:
                 if p["iss"] != mapping[r_iss]:
                     anomalies.append(f"Émetteur ≠ nom court référence ({mapping[r_iss]})")
+            elif is_acronym(p["iss"], r_iss):
+                anomalies.append(f"Émetteur en sigle/ticker ({p['iss']})")
             elif sc < ISSUER_THRESHOLD:
                 anomalies.append(f"Émetteur à vérifier (score {sc})")
             elif p["iss"] != target_iss:
