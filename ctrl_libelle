@@ -29,7 +29,7 @@ REUTERS_SHEET = 0              # utilisé seulement si REUTERS_FILE est un xlsx
 CSV_SEP = ";"
 
 MAPPING_FILE = "mapping_emetteurs.xlsx"   # optionnel, ignoré s'il n'existe pas
-OUTPUT_FILE = "controle_libelles.xlsx"
+OUTPUT_FILE = r"P:\CPSI_CONTROL_DATA\SAS_DATA\02_Controles_Referentiel_Valeur\Resultat_Controle_Jour\controle_libelles.xlsx"
 
 COL_ISIN = "ISIN"
 COL_LABEL = "S2I_Security_Name"
