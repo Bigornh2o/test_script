@@ -38,7 +38,7 @@ COL_R_ISSUER = "Issuer Name"   # colonnes Reuters
 COL_R_COUPON = "Coupon Rate"
 COL_R_MATURITY = "Maturity Date"
 
-PCT_SEP = " % "                # séparateur coupon/date attendu
+PCT_SEP = "% "                 # séparateur coupon/date attendu (% collé au coupon)
 PERP_TOKEN = "PERP"
 MAX_ISSUER_LEN = 25            # longueur max du nom court proposé
 ISSUER_THRESHOLD = 80          # score mini (0-100) pour considérer l'émetteur OK
@@ -182,8 +182,14 @@ def issuer_score(lbl_iss, ref_iss):
     return round(max(_ratio(" ".join(a), " ".join(b)), _ratio("".join(a), "".join(b))))
 
 
+def strip_amp(s):
+    """Supprime les « & Co », « & Co. », « & Cie »... (et ce qui suit), puis tout « & » restant."""
+    s = re.sub(r"\s*&\s*(CO|CIE|COMPANY)\b\.?.*$", "", s)
+    return re.sub(r"\s+", " ", s.replace("&", " ")).strip()
+
+
 def short_name(ref_iss):
-    toks = clean(ref_iss).replace("/", " ").replace(",", " ").split()
+    toks = strip_amp(clean(ref_iss)).replace("/", " ").replace(",", " ").split()
     while toks and toks[-1].strip(".") in LEGAL_FORMS:
         toks.pop()
     res = ""
@@ -239,6 +245,11 @@ def load():
 
 def run():
     df, mapping = load()
+    # ISIN sans données Reuters : sortis du contrôle (traitement manuel), listés à part
+    no_ref = df[COL_R_ISSUER].map(clean) == ""
+    sans_reuters = df.loc[no_ref, [c for c in df.columns if c not in (COL_R_ISSUER, COL_R_COUPON, COL_R_MATURITY)]]
+    df = df.loc[~no_ref].reset_index(drop=True)
+    print(f"{len(sans_reuters)} ISIN sans données Reuters exclus")
     parsed = [parse_label(x) for x in df[COL_LABEL]]
     ref_iss = df[COL_R_ISSUER].map(clean)
     scores = [issuer_score(p["iss"], r) if r else None for p, r in zip(parsed, ref_iss)]
@@ -250,7 +261,8 @@ def run():
             house.setdefault(r, Counter())[p["iss"]] += 1
     issuer_name = {}
     for r in set(ref_iss) - {""}:
-        issuer_name[r] = mapping.get(r) or (house[r].most_common(1)[0][0] if r in house else short_name(r))
+        issuer_name[r] = strip_amp(
+            mapping.get(r) or (house[r].most_common(1)[0][0] if r in house else short_name(r)))
 
     rows = []
     for i, p in enumerate(parsed):
@@ -266,10 +278,12 @@ def run():
         is_perp = (r_mat is None) if r_iss else (stype in PERP_TYPES or p["perp"])
         anomalies, infos = [], []
 
-        if not r_iss:
-            anomalies.append("Pas de données Reuters")
-
         # format
+        raw = str(row[COL_LABEL]) if pd.notna(row[COL_LABEL]) else ""
+        if re.sub(r"\s+", " ", raw).strip() != raw:
+            anomalies.append("Espaces en trop")
+        if "&" in p["iss"]:
+            anomalies.append("« & » dans le nom émetteur")
         fm = FORMAT_RE.match(label)
         if not fm:
             anomalies.append("Format non conforme")
@@ -368,12 +382,12 @@ def run():
              .value_counts().rename_axis("Anomalie").reset_index(name="Nb"))
     statuts = res["Statut"].value_counts().rename_axis("Statut").reset_index(name="Nb")
 
-    write(res, emetteurs, statuts, synth)
+    write(res, emetteurs, statuts, synth, sans_reuters)
     print(statuts.to_string(index=False))
     print(f"\n-> {OUTPUT_FILE}")
 
 
-def write(res, emetteurs, statuts, synth):
+def write(res, emetteurs, statuts, synth, sans_reuters):
     from openpyxl.styles import PatternFill, Font
     from openpyxl.utils import get_column_letter
     fills = {"OK": "C6EFCE", "OK (info)": "DDEBF7", "A REVOIR": "FFEB9C", "KO": "FFC7CE"}
@@ -382,6 +396,7 @@ def write(res, emetteurs, statuts, synth):
         emetteurs.to_excel(xw, "Emetteurs", index=False)
         statuts.to_excel(xw, "Synthese", index=False)
         synth.to_excel(xw, "Synthese", index=False, startrow=len(statuts) + 3)
+        sans_reuters.to_excel(xw, "Sans_Reuters", index=False)
         for ws in xw.book.worksheets:
             ws.freeze_panes = "A2"
             ws.auto_filter.ref = ws.dimensions
