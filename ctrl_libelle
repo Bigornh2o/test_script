@@ -280,8 +280,8 @@ def run():
 
         # format
         raw = str(row[COL_LABEL]) if pd.notna(row[COL_LABEL]) else ""
-        if re.sub(r"\s+", " ", raw).strip() != raw:
-            anomalies.append("Espaces en trop")
+        if re.search(r"\d\s+%", raw):
+            anomalies.append("Espace entre le coupon et le %")
         if "&" in p["iss"]:
             anomalies.append("« & » dans le nom émetteur")
         fm = FORMAT_RE.match(label)
