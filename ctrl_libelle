@@ -373,8 +373,6 @@ def run():
 
         # format
         raw = str(row[COL_LABEL]) if pd.notna(row[COL_LABEL]) else ""
-        if re.search(r"\d\s+%", raw):
-            infos.append("Espace entre le coupon et le %")
         if len(raw.strip()) > MAX_LABEL_LEN:
             anomalies.append(f"Libellé > {MAX_LABEL_LEN} car. ({len(raw.strip())})")
         removed = [t for t in p["iss"].split()[1:] if t in WORDS_REMOVED]
