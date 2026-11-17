@@ -40,7 +40,7 @@ COL_R_MATURITY = "Maturity Date"
 
 PCT_SEP = "% "                 # séparateur coupon/date attendu (% collé au coupon)
 PERP_TOKEN = "PERP"
-MAX_ISSUER_LEN = 25            # longueur max du nom court proposé
+MAX_LABEL_LEN = 40             # longueur max du libellé S2I
 ISSUER_THRESHOLD = 80          # score mini (0-100) pour considérer l'émetteur OK
 PERP_TYPES = {202, 203}
 VAR_TYPES = {205}
@@ -65,6 +65,25 @@ LEGAL_FORMS = {
 GENERIC = {"GROUP", "GROUPE", "HOLDING", "HOLDINGS", "FINANCE", "FIN", "INTERNATIONAL", "INTL",
            "FUNDING", "CAPITAL", "SERVICES", "BV"}
 SYNONYMS = {"BANQUE": "BANK", "BANCA": "BANK", "BANCO": "BANK", "BANKA": "BANK"}
+# abréviations utilisées pour faire tenir le libellé en MAX_LABEL_LEN caractères
+ABBREV = {
+    "INTERNATIONAL": "INTL", "CORPORATION": "CORP", "COMPANY": "CO", "FINANCE": "FIN",
+    "FINANCIAL": "FINL", "FINANCIERE": "FIN", "HOLDINGS": "HLDG", "HOLDING": "HLDG",
+    "GROUPE": "GRP", "GROUP": "GRP", "BANQUE": "BQ", "BANK": "BK", "KANTONALBANK": "KB",
+    "LANDESBANK": "LB", "SPAARBANK": "SPB", "CAPITAL": "CAP", "INVESTMENT": "INV",
+    "INVESTMENTS": "INV", "MANAGEMENT": "MGMT", "INSURANCE": "INS", "ASSURANCES": "ASS",
+    "ASSURANCE": "ASS", "SERVICES": "SVCS", "INDUSTRIES": "IND", "INDUSTRIAL": "IND",
+    "COMMUNICATIONS": "COMM", "TELECOMMUNICATIONS": "TELECOM", "DEVELOPMENT": "DEV",
+    "INTERNATIONALE": "INTL", "NATIONAL": "NATL", "NATIONALE": "NATL", "GOVERNMENT": "GOVT",
+    "REPUBLIC": "REP", "KINGDOM": "KGDM", "SOCIETE": "STE", "GENERALE": "GEN", "GENERAL": "GEN",
+    "AUTHORITY": "AUTH", "PROPERTIES": "PROP", "PROPERTY": "PROP", "REAL": "RE", "ESTATE": "EST",
+    "ENERGY": "ENRG", "PETROLEUM": "PETRO", "AUTOMOBILE": "AUTO", "AUTOMOTIVE": "AUTO",
+    "VERSICHERUNG": "VERS", "GRUPPE": "GRP", "MUNICIPALITY": "MUN", "FUNDING": "FDG",
+}
+STOPWORDS = {"FOR", "AND", "OF", "THE", "DE", "DU", "DES", "LA", "LE", "LES", "FUER", "FUR", "DER",
+             "DIE", "DAS", "VON", "VAN", "DEN", "ET", "Y", "DEL", "DI", "DELLA"}
+LEGAL_STRICT = LEGAL_FORMS - STOPWORDS - {"AS", "CO"}
+DROPPABLE = GENERIC | {"GRP", "HLDG", "FDG", "SVCS", "CAP", "CO", "THE", "OF", "DE", "DU", "LA", "LE"}
 
 FORMAT_RE = re.compile(
     r"^(?P<iss>\S.*?) (?P<cpn>\d+\.\d+)" + re.escape(PCT_SEP) +
@@ -166,7 +185,8 @@ def parse_label(label):
 def issuer_tokens(s):
     toks = re.sub(r"[^A-Z0-9 ]", " ", clean(s).replace("/", " ")).split()
     toks = [SYNONYMS.get(t, t) for t in toks]
-    return [t for t in toks if t not in LEGAL_FORMS and t not in GENERIC]
+    toks = [ABBREV.get(t, t) for t in toks]
+    return [t for t in toks if t not in LEGAL_FORMS and t not in DROPPABLE]
 
 
 def issuer_score(lbl_iss, ref_iss):
@@ -190,14 +210,48 @@ def strip_amp(s):
 
 def short_name(ref_iss):
     toks = strip_amp(clean(ref_iss)).replace("/", " ").replace(",", " ").split()
-    while toks and toks[-1].strip(".") in LEGAL_FORMS:
+    while len(toks) > 1 and toks[-1].strip(".") in LEGAL_FORMS:
         toks.pop()
-    res = ""
-    for t in toks:
-        if len(res) + len(t) + (1 if res else 0) > MAX_ISSUER_LEN:
+    return " ".join(toks)
+
+
+def fit_issuer(iss, budget):
+    """Raccourcit l'émetteur pour tenir dans `budget` caractères. Étapes, arrêt dès que ça tient :
+    1) coupe à une forme juridique en milieu de nom (« VIENNA INSURANCE GROUP AG WIENER... »)
+    2) retire les mots vides (OF, FOR, DU, FUER...)   3) abréviations (de la fin vers le début)
+    4) retire les mots génériques (GRP, HLDG, FIN...) 5) raccourcit le mot le plus long (4 lettres mini)
+    6) retire les derniers mots                       7) en dernier recours, coupe."""
+    toks = iss.split()
+    fits = lambda: len(" ".join(toks)) <= budget
+    if not fits():
+        for i in range(1, len(toks)):
+            if toks[i].strip(".") in LEGAL_STRICT:
+                toks = toks[:i]
+                break
+    while not fits() and len(toks) > 1 and toks[-1].strip(".") in LEGAL_FORMS:
+        toks.pop()
+    for i in reversed(range(1, len(toks))):
+        if fits():
             break
-        res = f"{res} {t}".strip()
-    return res or " ".join(toks)[:MAX_ISSUER_LEN]
+        if toks[i] in STOPWORDS:
+            toks.pop(i)
+    for i in reversed(range(len(toks))):
+        if fits():
+            break
+        toks[i] = ABBREV.get(toks[i], toks[i])
+    for i in reversed(range(1, len(toks))):
+        if fits():
+            break
+        if toks[i] in DROPPABLE:
+            toks.pop(i)
+    while not fits():
+        j = max(range(len(toks)), key=lambda k: len(toks[k]))
+        if len(toks[j]) <= 4:
+            break
+        toks[j] = toks[j][:-1].rstrip("-")
+    while not fits() and len(toks) > 1:
+        toks.pop()
+    return " ".join(toks)[:max(budget, 1)]
 
 
 def to_date(x):
@@ -282,6 +336,8 @@ def run():
         raw = str(row[COL_LABEL]) if pd.notna(row[COL_LABEL]) else ""
         if re.search(r"\d\s+%", raw):
             anomalies.append("Espace entre le coupon et le %")
+        if len(raw.strip()) > MAX_LABEL_LEN:
+            anomalies.append(f"Libellé > {MAX_LABEL_LEN} car. ({len(raw.strip())})")
         if "&" in p["iss"]:
             anomalies.append("« & » dans le nom émetteur")
         fm = FORMAT_RE.match(label)
@@ -335,8 +391,6 @@ def run():
                 anomalies.append(f"Émetteur à vérifier (score {sc})")
             elif p["iss"] != target_iss:
                 infos.append(f"Nom émetteur non homogène (majoritaire : {target_iss})")
-            if len(p["iss"]) > MAX_ISSUER_LEN:
-                infos.append(f"Nom émetteur long ({len(p['iss'])} car.)")
 
         # libellé proposé
         cpn = r_cpn if pd.notna(r_cpn) else p["cpn"]
@@ -344,7 +398,11 @@ def run():
         iss = target_iss or p["iss"]
         proposed = ""
         if iss and cpn is not None and mat:
-            proposed = f"{iss} {fmt_cpn(cpn)}{PCT_SEP}{mat if isinstance(mat, str) else mat.strftime('%d/%m/%Y')}"
+            suffix = f" {fmt_cpn(cpn)}{PCT_SEP}{mat if isinstance(mat, str) else mat.strftime('%d/%m/%Y')}"
+            iss_fit = fit_issuer(iss, MAX_LABEL_LEN - len(suffix))
+            if iss_fit != iss:
+                infos.append(f"Émetteur raccourci pour tenir en {MAX_LABEL_LEN} car. ({iss} -> {iss_fit})")
+            proposed = iss_fit + suffix
 
         statut = "OK" if not anomalies else "KO"
         if statut == "OK" and proposed and proposed != label:
