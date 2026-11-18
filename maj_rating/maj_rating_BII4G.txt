@@ -157,15 +157,30 @@ def lire_audit(path, tentatives=5):
 
 df_audit_ok = lire_audit(audit_ok_path)
 df_audit_err = lire_audit(audit_err_path)
+ 
+# [MODIF] colonne ajoutée aux audits OK existants (anciennes lignes = vide)
+if "S2i_Security_Name" not in df_audit_ok.columns:
+    df_audit_ok["S2i_Security_Name"] = ""
 
 # [MODIF] codes déjà faits = audits OK de TOUS les robots (lecture seule pour ceux des autres)
-codes_deja_traite = set(df_audit_ok["Security_S2I"])
+audits_ok_tous = [df_audit_ok]
 for p in Path(AUDIT_DIR).glob("audit_oval_bds*.xlsx"):
     if p.name.startswith("~$") or os.path.normcase(str(p)) == os.path.normcase(audit_ok_path):
         continue
-    codes_deja_traite |= set(lire_audit(p)["Security_S2I"])
-
+    audits_ok_tous.append(lire_audit(p))
+df_ok_tous = pd.concat(audits_ok_tous, ignore_index=True)
+df_ok_tous["Security_S2I"] = df_ok_tous["Security_S2I"].astype(str).str.strip()
+dernier_log = df_ok_tous.groupby("Security_S2I")["Log"].last().astype(str).to_dict()
+codes_deja_traite = set(dernier_log)
+ 
 reste = [row for row in liste_isin if str(row[0]).strip() not in codes_deja_traite]
+ 
+# [MODIF] liste des codes sautés car déjà traités, avec la date du dernier passage
+deja = [str(row[0]).strip() for row in liste_isin if str(row[0]).strip() in codes_deja_traite]
+if deja:
+    print(f"Robot {ROBOT_ID} : {len(deja)} code(s) déjà traité(s), ignoré(s) :")
+    for c in deja:
+        print(f"  - {c} (dernier passage : {dernier_log[c][:19]})")
 print(f"Robot {ROBOT_ID} : {len(reste)} code(s) restant(s) à traiter")
 
 # =========================
@@ -628,7 +643,11 @@ def run(playwright):
                     if MESSAGE_SUCCES in message_final.upper():
                         log(f"OK : {security_s2i} traité en {time.time() - debut_valeur:.0f}s")
                         log_message = f"{datetime.now():%Y-%m-%d %H:%M:%S} - VALEUR {security_s2i} traite - {message_final}"
-                        df_audit_ok.loc[len(df_audit_ok)] = [security_s2i, log_message]
+                        df_audit_ok.loc[len(df_audit_ok)] = {  # [MODIF] par nom de colonne
+                            "Security_S2I": security_s2i,
+                            "Log": log_message,
+                            "S2i_Security_Name": v2s(row[4]),  # libellé saisi dans S2i
+                        }
                         df_audit_err = df_audit_err[df_audit_err["Security_S2I"] != security_s2i].reset_index(drop=True)
                         nb_ok += 1
                     else:
