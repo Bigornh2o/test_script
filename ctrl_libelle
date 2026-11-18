@@ -199,7 +199,7 @@ def parse_label(label):
 
 # --------------------------- émetteur ---------------------------
 def issuer_tokens(s):
-    toks = re.sub(r"[^A-Z0-9 ]", " ", clean(s).replace("/", " ")).split()
+    toks = re.sub(r"[^A-Z0-9 ]", " ", strip_apos(clean(s)).replace("/", " ")).split()
     toks = [SYNONYMS.get(t, t) for t in toks]
     toks = [ABBREV.get(t, t) for t in toks]
     return [t for t in toks if t not in LEGAL_FORMS and t not in DROPPABLE]
@@ -237,6 +237,17 @@ def issuer_score(lbl_iss, ref_iss):
     return round(max(_ratio(" ".join(a), " ".join(b)), _ratio("".join(a), "".join(b))))
 
 
+APOS = "'’‘`´"
+APOS_RE = "[" + re.escape(APOS) + "]"
+
+
+def strip_apos(s):
+    """MOODY'S -> MOODYS ; D'INFRASTRUCTURE -> INFRASTRUCTURE ; L'ENVIRONNEMENT -> ENVIRONNEMENT ;
+    toute autre apostrophe est supprimée (O'REILLY -> OREILLY)."""
+    s = re.sub(r"\b[LD]" + APOS_RE + r"(?=\w)", "", s)
+    return re.sub(APOS_RE, "", s)
+
+
 def strip_amp(s):
     """Supprime les « & Co », « & Co. », « & Cie »... (et ce qui suit), puis tout « & » restant."""
     s = re.sub(r"\s*&\s*(CO|CIE|COMPANY)\b\.?.*$", "", s)
@@ -244,7 +255,7 @@ def strip_amp(s):
 
 
 def short_name(ref_iss):
-    toks = strip_amp(clean(ref_iss)).replace("/", " ").replace(",", " ").split()
+    toks = strip_apos(strip_amp(clean(ref_iss))).replace("/", " ").replace(",", " ").split()
     while len(toks) > 1 and toks[-1].replace(".", "") in LEGAL_FORMS:
         toks.pop()
     if len(toks) > 1 and toks[0] == "THE":
@@ -353,7 +364,7 @@ def run():
     issuer_name = {}
     for r in set(ref_iss) - {""}:
         if r in mapping:
-            issuer_name[r] = strip_amp(mapping[r])
+            issuer_name[r] = strip_apos(strip_amp(mapping[r]))
         else:
             issuer_name[r] = drop_words(short_name(house[r].most_common(1)[0][0] if r in house else r))
 
@@ -378,6 +389,8 @@ def run():
         removed = [t for t in p["iss"].split()[1:] if t in WORDS_REMOVED]
         if removed:
             anomalies.append(f"Mot à retirer de l'émetteur ({', '.join(removed)})")
+        if re.search(APOS_RE, p["iss"]):
+            anomalies.append("Apostrophe dans le nom émetteur")
         if "&" in p["iss"]:
             anomalies.append("« & » dans le nom émetteur")
         fm = FORMAT_RE.match(label)
@@ -436,7 +449,7 @@ def run():
                          and t not in target_iss.split()]
                 if legal and drop_words(short_name(p["iss"])) == target_iss:
                     infos.append(f"Forme juridique à retirer ({' '.join(legal)})")
-                else:
+                elif drop_words(short_name(p["iss"])) != target_iss:   # sinon déjà couvert (apostrophe, &, mot retiré)
                     infos.append(f"Nom émetteur non homogène (retenu : {target_iss})")
 
         # libellé proposé
