@@ -11,8 +11,8 @@ import zlib  # [MODIF] répartition stable des codes entre robots
 # =========================
 # Paramètres
 # =========================
-CHEMIN_INPUT = r"C:\Users\ut34e9\Desktop\Python\maj_rating\output_obligations_rating.xlsx"
-AUDIT_DIR = r"C:\Users\ut34e9\Desktop\Python\maj_rating\Audit"
+CHEMIN_INPUT = r"P:\CPSI_CONTROL_DATA\SAS_DATA\01_MAJ_S2I\85_MAJ_Libelle_Obligations\output_obligations.xlsx"
+AUDIT_DIR = r"P:\CPSI_CONTROL_DATA\SAS_DATA\01_MAJ_S2I\85_MAJ_Libelle_Obligations\Audit"
 DOSSIER_MDP = r"P:\CPSI_CONTROL_DATA\SAS_DATA\000_Parametres_Documents"
 URL_S2I = "https://s2i-frontindprd.ch.pbk/caiportal/index2.html"
 
