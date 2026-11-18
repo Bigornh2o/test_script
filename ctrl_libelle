@@ -432,7 +432,12 @@ def run():
             elif sc < ISSUER_THRESHOLD:
                 anomalies.append(f"Émetteur à vérifier (score {sc})")
             elif p["iss"] != target_iss:
-                infos.append(f"Nom émetteur non homogène (majoritaire : {target_iss})")
+                legal = [t for t in p["iss"].split() if t.replace(".", "") in LEGAL_FORMS
+                         and t not in target_iss.split()]
+                if legal and drop_words(short_name(p["iss"])) == target_iss:
+                    infos.append(f"Forme juridique à retirer ({' '.join(legal)})")
+                else:
+                    infos.append(f"Nom émetteur non homogène (retenu : {target_iss})")
 
         # libellé proposé
         cpn = r_cpn if pd.notna(r_cpn) else p["cpn"]
