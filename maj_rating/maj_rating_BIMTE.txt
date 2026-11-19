@@ -66,7 +66,12 @@ CHAMPS_PERIODES = [
 # Utils de base
 # =========================
 def log(message):
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {str(message).encode('ascii', 'replace').decode()}")
+    # [MODIF] accents conservés ; repli en ASCII seulement si la console ne sait pas les afficher
+    ligne = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}"
+    try:
+        print(ligne, flush=True)
+    except UnicodeEncodeError:
+        print(ligne.encode('ascii', 'replace').decode(), flush=True)
 
 def en_texte(v):
     if pd.isna(v):
@@ -170,16 +175,28 @@ for p in Path(AUDIT_DIR).glob("audit_oval_bds*.xlsx"):
     audits_ok_tous.append(lire_audit(p))
 df_ok_tous = pd.concat(audits_ok_tous, ignore_index=True)
 df_ok_tous["Security_S2I"] = df_ok_tous["Security_S2I"].astype(str).str.strip()
-dernier_log = df_ok_tous.groupby("Security_S2I")["Log"].last().astype(str).to_dict()
-codes_deja_traite = set(dernier_log)
+df_ok_tous["Log"] = df_ok_tous["Log"].astype(str)
+# tri chronologique (le log commence par "AAAA-MM-JJ HH:MM:SS") pour avoir le vrai dernier passage
+dernier_log = df_ok_tous.sort_values("Log").groupby("Security_S2I")["Log"].last().to_dict()
+ 
+# [MODIF] on ne saute que les codes déjà traités AUJOURD'HUI (relance / crash) ;
+# un code traité un jour précédent est retraité
+aujourdhui = datetime.now().strftime("%Y-%m-%d")
+codes_deja_traite = set(df_ok_tous.loc[df_ok_tous["Log"].str.startswith(aujourdhui), "Security_S2I"])
  
 reste = [row for row in liste_isin if str(row[0]).strip() not in codes_deja_traite]
  
-# [MODIF] liste des codes sautés car déjà traités, avec la date du dernier passage
-deja = [str(row[0]).strip() for row in liste_isin if str(row[0]).strip() in codes_deja_traite]
-if deja:
-    print(f"Robot {ROBOT_ID} : {len(deja)} code(s) déjà traité(s), ignoré(s) :")
-    for c in deja:
+codes_liste = [str(row[0]).strip() for row in liste_isin]
+deja_aujourdhui = [c for c in codes_liste if c in codes_deja_traite]
+deja_avant = [c for c in codes_liste if c in dernier_log and c not in codes_deja_traite]
+ 
+if deja_aujourdhui:
+    print(f"Robot {ROBOT_ID} : {len(deja_aujourdhui)} code(s) déjà traité(s) aujourd'hui, ignoré(s) :")
+    for c in deja_aujourdhui:
+        print(f"  - {c} (dernier passage : {dernier_log[c][:19]})")
+if deja_avant:
+    print(f"Robot {ROBOT_ID} : {len(deja_avant)} code(s) déjà traité(s) un jour précédent, retraité(s) :")
+    for c in deja_avant:
         print(f"  - {c} (dernier passage : {dernier_log[c][:19]})")
 print(f"Robot {ROBOT_ID} : {len(reste)} code(s) restant(s) à traiter")
 
