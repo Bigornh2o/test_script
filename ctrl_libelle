@@ -60,11 +60,56 @@ MOTS_SUPPRIMABLES = {"THE", "OF", "FOR", "AND", "DE", "DU", "DES", "LA", "LE", "
                      "DAS", "VON", "VAN", "DEN", "ET", "DEL", "DI", "DELLA"}
 # 3) mots abrégés un par un, de la fin vers le début
 MOTS_ABREGES = {
-    "IMMOBILIER": "IMMO",
+    # Formes fréquentes
     "INTERNATIONAL": "INTL",
     "CORPORATION": "CORP",
+    "COMPANY": "CO",
+    "GROUP": "GRP",
+    "HOLDINGS": "HLDG",
+    "HOLDING": "HLDG",
+    "FINANCIAL": "FIN",
+    "FINANCE": "FIN",
+    "INVESTMENT": "INV",
+    "INVESTMENTS": "INV",
+    "MANAGEMENT": "MGMT",
+    "TECHNOLOGY": "TECH",
+    "TECHNOLOGIES": "TECH",
+    "COMMUNICATIONS": "COMM",
     "TELECOMMUNICATIONS": "TELECOM",
+    "INSURANCE": "INS",
+    "ASSURANCES": "ASS",
+    "ASSURANCE": "ASS",
+    "SERVICES": "SVCS",
+    "INDUSTRIES": "IND",
+    "INDUSTRIAL": "IND",
+    "DEVELOPMENT": "DEV",
+    "PROPERTY": "PROP",
+    "PROPERTIES": "PROP",
+    "CAPITAL": "CAP",
+    "TREASURY": "TREAS",
+    "UNLIMITED": "UNLTD",
+    "NATIONAL": "NATL",
+    "REPUBLIC": "REP",
+    "GOVERNMENT": "GOVT",
+
+    # Formes fréquentes en français
+    "COMPAGNIE": "CIE",
+    "BANQUE": "BQ",
+    "FEDERATIVE": "FED",
+    "DEVELOPPEMENT": "DEV",
+    "IMMOBILIERE": "IMMO",
+    "IMMOBILIER": "IMMO",
+    "TRANSPORT": "TRANS",
+    "ELECTRICITE": "ELECT",
+
+    # Formes fréquentes dans les noms européens
+    "BANK": "BK",
+    "FINANCIERINGSMAATSCHAPPIJ": "FIN MAATS",
+    "PFANDBRIEFBANK": "PFANDBRIEFBK",
+    "GESELLSCHAFT": "GES",
+    "RUECKVERSICHERUNGS": "RUECKVERS",
 }
+
 # ==============================================================
 
 try:
