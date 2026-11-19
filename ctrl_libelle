@@ -46,6 +46,25 @@ ISSUER_THRESHOLD = 80          # score mini (0-100) pour considérer l'émetteur
 WORDS_REMOVED = {"FINANCIAL", "FINANCE", "FIN", "SERVICES", "SERVICE", "SVCS", "FUNDING"}
 PERP_TYPES = {202, 203}
 VAR_TYPES = {205}
+
+# ---- RACCOURCIS DE L'ÉMETTEUR (appliqués UNIQUEMENT si le libellé dépasse MAX_LABEL_LEN) ----
+# Le script ne raccourcit jamais rien en dehors de ces listes. Si ça ne suffit pas, le titre sort en KO
+# « Émetteur trop long » et l'émetteur est listé dans l'onglet A_Raccourcir (à renseigner dans le mapping).
+# Ordre d'application : 1) EMETTEURS_COURTS  2) MOTS_SUPPRIMABLES  3) MOTS_ABREGES ; arrêt dès que ça tient.
+# 1) nom d'émetteur (ou début de nom) remplacé en entier, après nettoyage
+EMETTEURS_COURTS = {
+    "LVMH MOET HENNESSY LOUIS VUITTON": "LVMH",
+}
+# 2) mots supprimés (jamais le premier mot du nom), de la fin vers le début
+MOTS_SUPPRIMABLES = {"THE", "OF", "FOR", "AND", "DE", "DU", "DES", "LA", "LE", "LES", "FUER", "DER", "DIE",
+                     "DAS", "VON", "VAN", "DEN", "ET", "DEL", "DI", "DELLA"}
+# 3) mots abrégés un par un, de la fin vers le début
+MOTS_ABREGES = {
+    "IMMOBILIER": "IMMO",
+    "INTERNATIONAL": "INTL",
+    "CORPORATION": "CORP",
+    "TELECOMMUNICATIONS": "TELECOM",
+}
 # ==============================================================
 
 try:
@@ -62,12 +81,13 @@ MONTHS.update({"FEV": 2, "AVR": 4, "MAI": 5, "JUI": 6, "AOU": 8, "DEC": 12})
 LEGAL_FORMS = {
     "SA", "NV", "AG", "SE", "PLC", "INC", "LTD", "LIMITED", "GMBH", "SPA", "BV", "AB", "ASA",
     "OYJ", "SCA", "SAS", "SARL", "CORP", "CORPORATION", "CO", "COMPANY", "LLC", "LP", "KG",
-    "SCOSA", "SCRL", "CVBA", "UA", "KGAA", "LLC", "SRL", "SL", "AS", "A/S", "THE", "OF", "DE", "DU", "LA", "LE",
+    "SCOSA", "SCRL", "CVBA", "UA", "KGAA", "LLC", "SAU", "SAB", "SRL", "SL", "AS", "A/S", "THE", "OF", "DE", "DU", "LA", "LE",
 }
 GENERIC = {"GROUP", "GROUPE", "HOLDING", "HOLDINGS", "FINANCE", "FIN", "INTERNATIONAL", "INTL",
            "FUNDING", "CAPITAL", "SERVICES", "BV"}
 SYNONYMS = {"BANQUE": "BANK", "BANCA": "BANK", "BANCO": "BANK", "BANKA": "BANK"}
-# abréviations utilisées pour faire tenir le libellé en MAX_LABEL_LEN caractères
+# abréviations rencontrées dans les libellés EXISTANTS : sert uniquement à rapprocher un libellé du nom Reuters
+# (jamais utilisée pour générer un nom proposé)
 ABBREV = {
     "INTERNATIONAL": "INTL", "CORPORATION": "CORP", "COMPANY": "CO", "FINANCE": "FIN",
     "FINANCIAL": "FINL", "FINANCIERE": "FIN", "HOLDINGS": "HLDG", "HOLDING": "HLDG",
@@ -82,9 +102,6 @@ ABBREV = {
     "ENERGY": "ENRG", "PETROLEUM": "PETRO", "AUTOMOBILE": "AUTO", "AUTOMOTIVE": "AUTO",
     "VERSICHERUNG": "VERS", "GRUPPE": "GRP", "MUNICIPALITY": "MUN", "FUNDING": "FDG",
 }
-STOPWORDS = {"FOR", "AND", "OF", "THE", "DE", "DU", "DES", "LA", "LE", "LES", "FUER", "FUR", "DER",
-             "DIE", "DAS", "VON", "VAN", "DEN", "ET", "Y", "DEL", "DI", "DELLA"}
-LEGAL_STRICT = LEGAL_FORMS - STOPWORDS - {"AS", "CO"}
 DROPPABLE = GENERIC | {"GRP", "HLDG", "FDG", "SVCS", "CAP", "CO", "THE", "OF", "DE", "DU", "LA", "LE"}
 
 FORMAT_RE = re.compile(
@@ -199,9 +216,9 @@ def parse_label(label):
 
 # --------------------------- émetteur ---------------------------
 def issuer_tokens(s):
-    toks = re.sub(r"[^A-Z0-9 ]", " ", strip_apos(clean(s)).replace("/", " ")).split()
+    toks = re.sub(r"[^A-Z0-9 ]", " ", strip_apos(strip_paren(clean(s))).replace("/", " ")).split()
     toks = [SYNONYMS.get(t, t) for t in toks]
-    toks = [ABBREV.get(t, t) for t in toks]
+    toks = [ABBREV.get(MOTS_ABREGES.get(t, t), MOTS_ABREGES.get(t, t)) for t in toks]
     return [t for t in toks if t not in LEGAL_FORMS and t not in DROPPABLE]
 
 
@@ -241,6 +258,14 @@ APOS = "'’‘`´"
 APOS_RE = "[" + re.escape(APOS) + "]"
 
 
+def strip_paren(s):
+    """Supprime les parenthèses ET leur contenu : « ENEL (EX XYZ) » -> « ENEL » ;
+    parenthèse non fermée : tout ce qui suit est supprimé."""
+    s = re.sub(r"\([^()]*\)", " ", s)
+    s = re.sub(r"\(.*$", " ", s)
+    return re.sub(r"\s+", " ", s.replace(")", " ")).strip()
+
+
 def strip_apos(s):
     """MOODY'S -> MOODYS ; D'INFRASTRUCTURE -> INFRASTRUCTURE ; L'ENVIRONNEMENT -> ENVIRONNEMENT ;
     toute autre apostrophe est supprimée (O'REILLY -> OREILLY)."""
@@ -255,7 +280,7 @@ def strip_amp(s):
 
 
 def short_name(ref_iss):
-    toks = strip_apos(strip_amp(clean(ref_iss))).replace("/", " ").replace(",", " ").split()
+    toks = strip_apos(strip_amp(strip_paren(clean(ref_iss)))).replace("/", " ").replace(",", " ").split()
     while len(toks) > 1 and toks[-1].replace(".", "") in LEGAL_FORMS:
         toks.pop()
     if len(toks) > 1 and toks[0] == "THE":
@@ -264,42 +289,30 @@ def short_name(ref_iss):
 
 
 def fit_issuer(iss, budget):
-    """Raccourcit l'émetteur pour tenir dans `budget` caractères. Étapes, arrêt dès que ça tient :
-    1) coupe à une forme juridique en milieu de nom (« VIENNA INSURANCE GROUP AG WIENER... »)
-    2) retire les mots vides (OF, FOR, DU, FUER...)   3) abréviations (de la fin vers le début)
-    4) retire les mots génériques (GRP, HLDG, FIN...) 5) raccourcit le mot le plus long (4 lettres mini)
-    6) retire les derniers mots                       7) en dernier recours, coupe."""
+    """Fait tenir l'émetteur dans `budget` caractères en n'utilisant QUE les listes de la config.
+    Retourne (nom, tient). Aucune coupe de mot, aucun mot retiré hors liste."""
     toks = iss.split()
     fits = lambda: len(" ".join(toks)) <= budget
-    if not fits():
-        for i in range(1, len(toks)):
-            if toks[i].replace(".", "") in LEGAL_STRICT:
-                toks = toks[:i]
-                break
-    while not fits() and len(toks) > 1 and toks[-1].replace(".", "") in LEGAL_FORMS:
-        toks.pop()
+    if fits():
+        return " ".join(toks), True
+    # 1) émetteur (ou début de nom) remplacé en entier
+    full = " ".join(toks)
+    for long_name, short in sorted(EMETTEURS_COURTS.items(), key=lambda kv: -len(kv[0])):
+        if full == long_name or full.startswith(long_name + " "):
+            toks = (short + full[len(long_name):]).split()
+            break
+    # 2) mots supprimables (jamais le premier), de la fin vers le début
     for i in reversed(range(1, len(toks))):
         if fits():
             break
-        if toks[i] in STOPWORDS:
+        if toks[i] in MOTS_SUPPRIMABLES:
             toks.pop(i)
+    # 3) mots abrégés, de la fin vers le début
     for i in reversed(range(len(toks))):
         if fits():
             break
-        toks[i] = ABBREV.get(toks[i], toks[i])
-    for i in reversed(range(1, len(toks))):
-        if fits():
-            break
-        if toks[i] in DROPPABLE:
-            toks.pop(i)
-    while not fits():
-        j = max(range(len(toks)), key=lambda k: len(toks[k]))
-        if len(toks[j]) <= 4:
-            break
-        toks[j] = toks[j][:-1].rstrip("-")
-    while not fits() and len(toks) > 1:
-        toks.pop()
-    return " ".join(toks)[:max(budget, 1)]
+        toks[i] = MOTS_ABREGES.get(toks[i], toks[i])
+    return " ".join(toks), fits()
 
 
 def to_date(x):
@@ -364,11 +377,12 @@ def run():
     issuer_name = {}
     for r in set(ref_iss) - {""}:
         if r in mapping:
-            issuer_name[r] = strip_apos(strip_amp(mapping[r]))
+            issuer_name[r] = strip_apos(strip_amp(strip_paren(mapping[r])))
         else:
             issuer_name[r] = drop_words(short_name(house[r].most_common(1)[0][0] if r in house else r))
 
     rows = []
+    too_long = []
     for i, p in enumerate(parsed):
         row = df.iloc[i]
         label = clean(row[COL_LABEL])
@@ -389,6 +403,8 @@ def run():
         removed = [t for t in p["iss"].split()[1:] if t in WORDS_REMOVED]
         if removed:
             anomalies.append(f"Mot à retirer de l'émetteur ({', '.join(removed)})")
+        if "(" in p["iss"] or ")" in p["iss"]:
+            anomalies.append("Parenthèses dans le nom émetteur")
         if re.search(APOS_RE, p["iss"]):
             anomalies.append("Apostrophe dans le nom émetteur")
         if "&" in p["iss"]:
@@ -457,11 +473,18 @@ def run():
         mat = PERP_TOKEN if is_perp else (r_mat or mat_lbl)
         iss = target_iss or p["iss"]
         proposed = proposed_cmp = ""
+        iss_fit = ""
         if iss and cpn is not None and mat:
             suffix = f" {fmt_cpn(cpn)}{PCT_SEP}{mat if isinstance(mat, str) else mat.strftime('%d/%m/%Y')}"
-            iss_fit = fit_issuer(iss, MAX_LABEL_LEN - len(suffix))
-            if iss_fit != iss:
+            iss_fit, tient = fit_issuer(iss, MAX_LABEL_LEN - len(suffix))
+            if not tient:
+                anomalies.append(f"Émetteur trop long pour {MAX_LABEL_LEN} car. : à raccourcir (mapping ou listes)")
+                infos.append(f"Nom nettoyé : {iss} ({len(iss)} car., max {MAX_LABEL_LEN - len(suffix)})")
+                too_long.append((r_iss, iss, len(iss), MAX_LABEL_LEN - len(suffix)))
+                iss_fit = None
+            elif iss_fit != iss:
                 infos.append(f"Émetteur raccourci pour tenir en {MAX_LABEL_LEN} car. ({iss} -> {iss_fit})")
+        if iss_fit is not None and iss and cpn is not None and mat:
             proposed = proposed_cmp = iss_fit + suffix
             # libellé actuel identique au proposé, à l'écriture du coupon près (1.5% vs 1.50%) : pas de modif
             if p["cpn_str"] and cpn_ok(p["cpn_str"]) and p["cpn"] == round(float(cpn), 6):
@@ -505,12 +528,20 @@ def run():
              .value_counts().rename_axis("Anomalie").reset_index(name="Nb"))
     statuts = res["Statut"].value_counts().rename_axis("Statut").reset_index(name="Nb")
 
-    write(res, emetteurs, statuts, synth, sans_reuters)
+    a_raccourcir = (pd.DataFrame(too_long, columns=["Reuters_Issuer", "Nom_Nettoye", "Longueur", "Place_dispo_min"])
+                    .groupby(["Reuters_Issuer", "Nom_Nettoye", "Longueur"], as_index=False)
+                    .agg(Nb_titres=("Place_dispo_min", "size"), Place_dispo_min=("Place_dispo_min", "min"))
+                    .sort_values("Nb_titres", ascending=False))
+    a_raccourcir["Nom_Court"] = ""      # à renseigner puis copier dans mapping_emetteurs.xlsx
+    if len(a_raccourcir):
+        print(f"{len(a_raccourcir)} émetteurs à raccourcir à la main (onglet A_Raccourcir)")
+
+    write(res, emetteurs, statuts, synth, sans_reuters, a_raccourcir)
     print(statuts.to_string(index=False))
     print(f"\n-> {OUTPUT_FILE}")
 
 
-def write(res, emetteurs, statuts, synth, sans_reuters):
+def write(res, emetteurs, statuts, synth, sans_reuters, a_raccourcir):
     from openpyxl.styles import PatternFill, Font
     from openpyxl.utils import get_column_letter
     fills = {"OK": "C6EFCE", "OK (info)": "DDEBF7", "A REVOIR": "FFEB9C", "KO": "FFC7CE"}
@@ -520,6 +551,7 @@ def write(res, emetteurs, statuts, synth, sans_reuters):
         statuts.to_excel(xw, "Synthese", index=False)
         synth.to_excel(xw, "Synthese", index=False, startrow=len(statuts) + 3)
         sans_reuters.to_excel(xw, "Sans_Reuters", index=False)
+        a_raccourcir.to_excel(xw, "A_Raccourcir", index=False)
         for ws in xw.book.worksheets:
             ws.freeze_panes = "A2"
             ws.auto_filter.ref = ws.dimensions
