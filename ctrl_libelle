@@ -280,7 +280,7 @@ def issuer_score(lbl_iss, ref_iss):
     a, b = issuer_tokens(lbl_iss), issuer_tokens(ref_iss)
     if not a or not b:
         return 0
-    if set(a) <= set(b):
+    if set(a) <= set(b) and a[0] == b[0]:       # mots du libellé inclus dans Reuters ET même premier mot
         return 100
     if is_acronym(lbl_iss, ref_iss):                                # sigle / ticker (GS, F...) : refusé
         return 60
