@@ -123,7 +123,7 @@ MONTHS.update({"FEV": 2, "AVR": 4, "MAI": 5, "JUI": 6, "AOU": 8, "DEC": 12})
 LEGAL_FORMS = {
     "SA", "NV", "AG", "SE", "PLC", "INC", "LTD", "LIMITED", "GMBH", "SPA", "BV", "AB", "ASA",
     "OYJ", "SCA", "SAS", "SARL", "CORP", "CORPORATION", "CO", "COMPANY", "LLC", "LP", "KG",
-    "SCOSA", "SCRL", "CVBA", "UA", "KGAA", "LLC", "SAU", "SAB", "SRL", "SL", "AS", "A/S", "THE", "OF", "DE", "DU", "LA", "LE",
+    "SCOSA", "SCRL", "CVBA", "UA", "KGAA", "LLC", "SAU", "SAB", "CV", "BVBA", "CVOA", "SRL", "SL", "AS", "A/S", "THE", "OF", "DE", "DU", "LA", "LE",
 }
 GENERIC = {"GROUP", "GROUPE", "HOLDING", "HOLDINGS", "FINANCE", "FIN", "INTERNATIONAL", "INTL",
            "FUNDING", "CAPITAL", "SERVICES", "BV"}
